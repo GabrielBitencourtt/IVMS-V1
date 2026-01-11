@@ -98,6 +98,33 @@ async def health():
     }
 
 
+@app.get("/debug/{stream_key}")
+async def debug_stream(stream_key: str):
+    """Debug endpoint para verificar status de um stream"""
+    import os as os_module
+    
+    stream_info = stream_manager.get_stream_status(stream_key)
+    stream_dir = HLS_DIR / stream_key
+    
+    files = []
+    playlist_content = None
+    
+    if stream_dir.exists():
+        files = os_module.listdir(stream_dir)
+        playlist_path = stream_dir / "index.m3u8"
+        if playlist_path.exists():
+            async with aiofiles.open(playlist_path, mode='r') as f:
+                playlist_content = await f.read()
+    
+    return {
+        "stream_key": stream_key,
+        "stream_info": stream_info,
+        "hls_dir_exists": stream_dir.exists(),
+        "files": files,
+        "playlist_content": playlist_content
+    }
+
+
 @app.post("/streams", response_model=StreamInfo)
 async def create_stream(stream: StreamCreate, background_tasks: BackgroundTasks):
     """

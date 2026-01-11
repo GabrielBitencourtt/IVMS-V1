@@ -45,13 +45,15 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS
+# CORS - Permitir todas as origens para streaming
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=["*"],  # Permitir qualquer origem
+    allow_credentials=False,  # Não usar credentials com wildcard
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,  # Cache preflight por 24h
 )
 
 

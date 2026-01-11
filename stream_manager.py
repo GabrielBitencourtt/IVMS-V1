@@ -32,24 +32,31 @@ class StreamManager:
         
         cmd = ["ffmpeg", "-y"]
         
-        # Parâmetros de input - similar ao OpenCV VideoCapture
+        # Parâmetros de input para streaming contínuo
         if is_rtsp:
             cmd.extend([
                 "-rtsp_transport", "tcp",
                 "-rtsp_flags", "prefer_tcp",
-                "-timeout", "10000000",
+                "-timeout", "10000000",            # 10s timeout
                 "-reorder_queue_size", "500",
                 "-max_delay", "500000",
                 "-analyzeduration", "3000000",
                 "-probesize", "3000000",
-                "-fflags", "+genpts+discardcorrupt+nobuffer",
+                "-fflags", "+genpts+discardcorrupt+igndts",
                 "-flags", "low_delay",
+                "-avoid_negative_ts", "make_zero",
+                "-use_wallclock_as_timestamps", "1",  # Importante para live
             ])
         else:
             cmd.extend([
-                "-fflags", "nobuffer+genpts+discardcorrupt",
+                "-fflags", "nobuffer+genpts+discardcorrupt+igndts",
                 "-flags", "low_delay",
+                "-avoid_negative_ts", "make_zero",
+                "-use_wallclock_as_timestamps", "1",
             ])
+        
+        # Opção para reconexão automática (apenas funciona com algumas versões)
+        cmd.extend(["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"])
         
         cmd.extend(["-i", source_url])
         
@@ -76,14 +83,14 @@ class StreamManager:
                 "-an",                       # Sem áudio
             ])
         
-        # Parâmetros HLS
+        # Parâmetros HLS para live streaming contínuo
         cmd.extend([
             "-f", "hls",
-            "-hls_time", "2",
-            "-hls_list_size", "4",
-            "-hls_flags", "delete_segments+append_list",
+            "-hls_time", "2",                    # Segmentos de 2 segundos
+            "-hls_list_size", "5",               # Manter 5 segmentos na playlist
+            "-hls_flags", "delete_segments+append_list+omit_endlist",  # omit_endlist = stream infinito
             "-hls_segment_type", "mpegts",
-            "-hls_segment_filename", str(stream_dir / "segment_%03d.ts"),
+            "-hls_segment_filename", str(stream_dir / "segment_%05d.ts"),
             str(output_path)
         ])
         
@@ -226,10 +233,13 @@ class StreamManager:
             self.streams[stream_key]["error"] = str(e)
     
     async def _monitor_process(self, stream_key: str, process: subprocess.Popen):
-        """Monitora o processo FFmpeg e atualiza status"""
+        """Monitora o processo FFmpeg e reinicia se falhar"""
         
         # Aguardar um pouco antes de começar a monitorar
         await asyncio.sleep(10)
+        
+        restart_count = 0
+        max_restarts = 5
         
         while True:
             await asyncio.sleep(5)
@@ -237,19 +247,59 @@ class StreamManager:
             if stream_key not in self.processes:
                 break
             
+            if stream_key not in self.streams:
+                break
+                
             returncode = process.poll()
             
             if returncode is not None:
                 # Processo terminou
-                if stream_key in self.streams:
-                    if returncode == 0:
-                        self.streams[stream_key]["status"] = "stopped"
-                    else:
+                stderr = ""
+                try:
+                    stderr = process.stderr.read().decode() if process.stderr else ""
+                except:
+                    pass
+                    
+                print(f"⚠️ Stream {stream_key} stopped (code: {returncode})")
+                
+                # Tentar reiniciar se não excedeu limite
+                if restart_count < max_restarts:
+                    restart_count += 1
+                    print(f"🔄 Restarting stream {stream_key} (attempt {restart_count}/{max_restarts})")
+                    
+                    # Limpar processo antigo
+                    if stream_key in self.processes:
+                        del self.processes[stream_key]
+                    
+                    # Aguardar antes de reiniciar
+                    await asyncio.sleep(2)
+                    
+                    # Pegar info do stream
+                    if stream_key in self.streams:
+                        source_url = self.streams[stream_key].get("source_url")
+                        name = self.streams[stream_key].get("name")
+                        
+                        if source_url:
+                            # Reiniciar o stream
+                            await self.start_stream(stream_key, source_url, name)
+                            
+                            # Pegar o novo processo para continuar monitorando
+                            if stream_key in self.processes:
+                                process = self.processes[stream_key]
+                                await asyncio.sleep(10)  # Aguardar estabilizar
+                                continue
+                    
+                    # Se não conseguiu reiniciar, sair do loop
+                    break
+                else:
+                    print(f"❌ Stream {stream_key} failed after {max_restarts} restart attempts")
+                    if stream_key in self.streams:
                         self.streams[stream_key]["status"] = "error"
-                        stderr = process.stderr.read().decode() if process.stderr else ""
-                        self.streams[stream_key]["error"] = stderr[-500:] if stderr else f"Exit code: {returncode}"
-                        print(f"❌ Stream {stream_key} failed: {self.streams[stream_key]['error']}")
-                break
+                        self.streams[stream_key]["error"] = f"Failed after {max_restarts} restarts: {stderr[-200:]}"
+                    break
+            else:
+                # Processo ainda rodando, resetar contador de restarts
+                restart_count = 0
     
     async def stop_stream(self, stream_key: str):
         """Para uma stream específica"""

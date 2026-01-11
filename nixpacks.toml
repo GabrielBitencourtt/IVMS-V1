@@ -1,6 +1,3 @@
-# Nixpacks configuration for Railway
-# Adiciona FFmpeg ao ambiente de build
-
 [phases.setup]
 nixPkgs = ["ffmpeg", "python311"]
 

@@ -46,58 +46,40 @@ class StreamManager:
         is_rtsp = source_url.lower().startswith("rtsp://")
         is_rtmp = source_url.lower().startswith("rtmp://")
         
-        # Construir comando base
+        # Construir comando base - otimizado para baixa latência
         cmd = ["ffmpeg", "-y"]  # -y para sobrescrever arquivos
+        
+        # Parâmetros comuns para baixa latência
+        cmd.extend([
+            "-fflags", "nobuffer+genpts+discardcorrupt",
+            "-flags", "low_delay",
+        ])
         
         # Parâmetros específicos por protocolo
         if is_rtsp:
             cmd.extend([
-                "-rtsp_transport", "tcp",       # TCP é mais estável para RTSP
-                "-rtsp_flags", "prefer_tcp",    # Preferir TCP
-                "-timeout", "5000000",          # Timeout de conexão (microsegundos)
-                "-analyzeduration", "2000000",  # Tempo de análise do stream
-                "-probesize", "2000000",        # Tamanho do probe
-                "-fflags", "+genpts+discardcorrupt",  # Gerar timestamps, descartar corrompidos
-                "-flags", "low_delay",          # Baixa latência
-                "-max_delay", "500000",         # Max delay 0.5s
-            ])
-        elif is_rtmp:
-            cmd.extend([
-                "-fflags", "nobuffer+genpts",   # Sem buffer, gerar timestamps
-                "-flags", "low_delay",          # Baixa latência
-            ])
-        else:
-            # Protocolo genérico (http, etc)
-            cmd.extend([
-                "-fflags", "nobuffer+genpts",
+                "-rtsp_transport", "tcp",
+                "-rtsp_flags", "prefer_tcp",
+                "-timeout", "5000000",
+                "-analyzeduration", "1000000",
+                "-probesize", "1000000",
             ])
         
         # Input URL
         cmd.extend(["-i", source_url])
         
-        # Parâmetros de codificação
+        # Parâmetros de codificação - usar copy para baixa latência
+        # Se a câmera já envia H.264, não precisa re-codificar
         cmd.extend([
-            "-c:v", "libx264",              # Codec de vídeo
-            "-preset", "ultrafast",         # Preset rápido para baixa latência
-            "-tune", "zerolatency",         # Otimizar para latência
-            "-profile:v", "baseline",       # Perfil compatível com mais players
-            "-level", "3.0",                # Nível de compatibilidade
-            "-pix_fmt", "yuv420p",          # Formato de pixel compatível
-            "-r", "25",                     # Frame rate
-            "-g", "50",                     # GOP size (2 segundos)
-            "-sc_threshold", "0",           # Desabilitar detecção de cena
-            "-b:v", "1500k",                # Bitrate de vídeo
-            "-maxrate", "1500k",            # Max bitrate
-            "-bufsize", "3000k",            # Buffer size
-            "-c:a", "aac",                  # Codec de áudio
-            "-ar", "44100",                 # Sample rate
-            "-b:a", "128k",                 # Bitrate de áudio
-            "-ac", "2",                     # 2 canais de áudio
-            "-f", "hls",                    # Formato de saída
-            "-hls_time", "2",               # Duração de cada segmento (segundos)
-            "-hls_list_size", "5",          # Número de segmentos na playlist
-            "-hls_flags", "delete_segments+append_list+independent_segments",
-            "-hls_segment_type", "mpegts",  # Tipo de segmento
+            "-vsync", "0",
+            "-copyts",
+            "-vcodec", "copy",           # Copiar vídeo sem re-codificar
+            "-an",                        # Sem áudio para menor latência
+            "-f", "hls",
+            "-hls_time", "1",             # Segmentos de 1 segundo
+            "-hls_list_size", "3",        # Manter apenas 3 segmentos
+            "-hls_flags", "delete_segments+append_list+omit_endlist",
+            "-hls_segment_type", "mpegts",
             "-hls_segment_filename", str(stream_dir / "segment_%03d.ts"),
             str(output_path)
         ])

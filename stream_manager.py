@@ -70,34 +70,36 @@ class StreamManager:
         stream_dir: Path,
         use_copy: bool = False
     ) -> list:
-        """Constrói comando FFmpeg ultra-robusto"""
+        """Constrói comando FFmpeg OTIMIZADO para streaming contínuo"""
         
         is_rtsp = source_url.lower().startswith("rtsp://")
         
-        cmd = ["ffmpeg", "-y", "-hide_banner"]
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
         
-        # Opções globais de tolerância a erros
+        # Opções globais para stream contínuo
         cmd.extend([
-            "-err_detect", "ignore_err",
-            "-fflags", "+genpts+discardcorrupt+igndts+nobuffer",
+            "-fflags", "+genpts+discardcorrupt+nobuffer",
             "-flags", "low_delay",
+            "-strict", "experimental",
         ])
         
-        # Configurações de entrada
+        # Configurações de entrada otimizadas
         if is_rtsp:
             cmd.extend([
                 "-rtsp_transport", "tcp",
                 "-rtsp_flags", "prefer_tcp",
-                "-timeout", "10000000",
-                "-reorder_queue_size", "2000",
+                "-stimeout", "5000000",
+                "-timeout", "5000000",
+                "-buffer_size", "1024000",
                 "-max_delay", "500000",
-                "-analyzeduration", "2000000",
-                "-probesize", "2000000",
+                "-reorder_queue_size", "500",
+                "-analyzeduration", "1000000",
+                "-probesize", "1000000",
             ])
         else:
             cmd.extend([
-                "-analyzeduration", "2000000",
-                "-probesize", "2000000",
+                "-analyzeduration", "1000000",
+                "-probesize", "1000000",
             ])
         
         cmd.extend(["-i", source_url])
@@ -105,40 +107,40 @@ class StreamManager:
         if use_copy:
             cmd.extend([
                 "-c:v", "copy",
-                "-an",
+                "-an",  # Sem áudio no copy mode
                 "-bsf:v", "h264_mp4toannexb",
             ])
         else:
-            # Re-encoding OTIMIZADO para Railway 8 vCPUs / 8GB RAM
+            # Re-encoding OTIMIZADO - SEM ÁUDIO para evitar problemas
             cmd.extend([
                 "-c:v", "libx264",
-                "-preset", "fast",                # Melhor qualidade que superfast
-                "-tune", "zerolatency",
-                "-profile:v", "main",             # Melhor compressão
-                "-level", "4.0",
+                "-preset", "veryfast",            # Mais rápido, menos CPU
+                "-tune", "zerolatency",           # Crítico para live
+                "-profile:v", "baseline",         # Máxima compatibilidade
+                "-level", "3.1",
                 "-pix_fmt", "yuv420p",
-                "-vf", "scale=1280:-2",           # 720p - boa qualidade
-                "-r", "25",                       # 25 fps fluido
-                "-g", "50",                       # GOP de 2s
-                "-keyint_min", "25",
-                "-sc_threshold", "0",
-                "-b:v", "1500k",                  # Bitrate bom para 720p
-                "-maxrate", "2000k",
-                "-bufsize", "3000k",
-                "-c:a", "aac",                    # Incluir áudio
-                "-b:a", "96k",
-                "-ar", "44100",
-                "-threads", "4",                  # Usar 4 threads (metade dos vCPUs)
+                "-vf", "scale=960:-2",            # 960p - bom equilíbrio
+                "-r", "20",                       # 20 fps
+                "-g", "40",                       # GOP = 2 segundos (20fps * 2)
+                "-keyint_min", "20",              # Keyframe mínimo = 1s
+                "-sc_threshold", "0",             # Desabilita scene change detection
+                "-b:v", "1000k",
+                "-maxrate", "1200k",
+                "-bufsize", "2000k",
+                "-an",                            # SEM ÁUDIO - evita stalls
+                "-threads", "2",
             ])
         
-        # HLS com segmentos menores = menos latência
+        # HLS OTIMIZADO para streaming contínuo em tempo real
         cmd.extend([
             "-f", "hls",
-            "-hls_time", "1",                     # Segmentos de 1s (menos latência)
-            "-hls_list_size", "5",
-            "-hls_flags", "delete_segments+append_list+omit_endlist",
+            "-hls_time", "1",                     # Segmentos de 1 segundo
+            "-hls_list_size", "3",                # Apenas 3 segmentos na playlist
+            "-hls_flags", "delete_segments+independent_segments",  # DELETAR segmentos antigos
             "-hls_segment_type", "mpegts",
-            "-hls_segment_filename", str(stream_dir / "s%d.ts"),
+            "-hls_start_number_source", "datetime",
+            "-start_number", "1",
+            "-hls_segment_filename", str(stream_dir / "seg_%03d.ts"),
             str(output_path)
         ])
         

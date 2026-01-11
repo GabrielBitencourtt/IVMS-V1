@@ -88,23 +88,16 @@ class StreamManager:
             cmd.extend([
                 "-rtsp_transport", "tcp",
                 "-rtsp_flags", "prefer_tcp",
-                "-stimeout", "5000000",           # 5s timeout
-                "-timeout", "5000000",
-                "-reconnect", "1",
-                "-reconnect_at_eof", "1",
-                "-reconnect_streamed", "1",
-                "-reconnect_delay_max", "2",      # Max 2s entre reconexões
+                "-timeout", "10000000",
                 "-reorder_queue_size", "2000",
                 "-max_delay", "500000",
-                "-analyzeduration", "2000000",    # 2s analyze
+                "-analyzeduration", "2000000",
                 "-probesize", "2000000",
             ])
         else:
             cmd.extend([
-                "-reconnect", "1",
-                "-reconnect_at_eof", "1",
-                "-reconnect_streamed", "1",
-                "-reconnect_delay_max", "2",
+                "-analyzeduration", "2000000",
+                "-probesize", "2000000",
             ])
         
         cmd.extend(["-i", source_url])
@@ -158,7 +151,7 @@ class StreamManager:
         source_url: str,
         name: Optional[str] = None
     ):
-        """Inicia conversão de RTSP/RTMP para HLS"""
+        """Inicia conversão de RTSP/RTMP para HLS (API pública)"""
         
         # Se já existe e está rodando, retornar
         if stream_key in self.processes:
@@ -170,11 +163,26 @@ class StreamManager:
         # Cancelar watchdog anterior
         await self._cancel_watchdog(stream_key)
         
+        await self._start_stream_internal(stream_key, source_url, name)
+    
+    async def _start_stream_internal(
+        self,
+        stream_key: str,
+        source_url: str,
+        name: Optional[str] = None
+    ):
+        """Lógica interna de iniciar stream (chamada por restart também)"""
+        
         # Criar/limpar diretório
         stream_dir = self.hls_dir / stream_key
         if stream_dir.exists():
             shutil.rmtree(stream_dir, ignore_errors=True)
         stream_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Preservar restart_count se existir
+        restart_count = 0
+        if stream_key in self.streams:
+            restart_count = self.streams[stream_key].get("restart_count", 0)
         
         # Registrar stream
         self.streams[stream_key] = {
@@ -183,7 +191,7 @@ class StreamManager:
             "status": "starting",
             "dir": str(stream_dir),
             "start_time": time.time(),
-            "restart_count": 0,
+            "restart_count": restart_count,
         }
         
         output_path = stream_dir / "index.m3u8"
@@ -205,16 +213,31 @@ class StreamManager:
                 print(f"ℹ️ Codec '{probe_info['codec']}' requires re-encoding")
             await self._start_with_reencode(stream_key, source_url, output_path, stream_dir)
     
-    async def _cancel_watchdog(self, stream_key: str):
+    async def _cancel_watchdog(self, stream_key: str, from_watchdog: bool = False):
         """Cancela watchdog de uma stream de forma segura"""
+        if stream_key not in self.watchdog_tasks:
+            return
+            
+        task = self.watchdog_tasks[stream_key]
+        
+        # Se está sendo chamado de dentro do próprio watchdog, só remover da lista
+        if from_watchdog:
+            del self.watchdog_tasks[stream_key]
+            return
+        
+        # Se a task já terminou, só limpar
+        if task.done():
+            del self.watchdog_tasks[stream_key]
+            return
+        
+        # Cancelar e aguardar com tratamento seguro
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError, RuntimeError, Exception):
+            pass
+        
         if stream_key in self.watchdog_tasks:
-            task = self.watchdog_tasks[stream_key]
-            if not task.done():
-                task.cancel()
-                try:
-                    await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
-                except (asyncio.CancelledError, asyncio.TimeoutError, RuntimeError):
-                    pass
             del self.watchdog_tasks[stream_key]
     
     async def _try_start_with_copy(
@@ -430,8 +453,9 @@ class StreamManager:
         name = self.streams[stream_key].get("name")
         
         if source_url:
-            await self._cancel_watchdog(stream_key)
-            await self.start_stream(stream_key, source_url, name)
+            # from_watchdog=True porque estamos sendo chamados de dentro do watchdog
+            await self._cancel_watchdog(stream_key, from_watchdog=True)
+            await self._start_stream_internal(stream_key, source_url, name)
     
     async def stop_stream(self, stream_key: str):
         """Para uma stream"""

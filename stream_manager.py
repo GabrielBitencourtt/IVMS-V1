@@ -109,37 +109,34 @@ class StreamManager:
                 "-bsf:v", "h264_mp4toannexb",
             ])
         else:
-            # Re-encoding ultra resiliente
+            # Re-encoding SUPER LEVE para servidores fracos
             cmd.extend([
                 "-c:v", "libx264",
-                "-preset", "ultrafast",
+                "-preset", "superfast",           # Mais rápido que ultrafast em alguns casos
                 "-tune", "zerolatency",
                 "-profile:v", "baseline",
                 "-level", "3.0",
                 "-pix_fmt", "yuv420p",
-                "-vsync", "cfr",
-                "-r", "15",
-                "-g", "15",
-                "-keyint_min", "15",
-                "-force_key_frames", "expr:gte(t,n_forced*1)",  # Keyframe cada 1s
+                "-vf", "scale=640:-2",            # Escala para 640px largura (MUITO mais leve)
+                "-r", "12",                       # 12 fps é suficiente para vigilância
+                "-g", "24",                       # Keyframe a cada 2s
+                "-keyint_min", "24",
                 "-sc_threshold", "0",
-                "-b:v", "600k",
-                "-maxrate", "800k",
-                "-bufsize", "1200k",
+                "-b:v", "400k",                   # Bitrate menor
+                "-maxrate", "500k",
+                "-bufsize", "800k",
                 "-an",
-                # Tolerância máxima a erros
-                "-x264opts", "no-scenecut",
+                "-threads", "1",                  # Limitar threads (menos CPU)
             ])
         
-        # HLS com configurações agressivas para live
+        # HLS com segmentos maiores = menos overhead
         cmd.extend([
             "-f", "hls",
-            "-hls_time", "1",
-            "-hls_list_size", "5",
-            "-hls_flags", "delete_segments+append_list+omit_endlist+temp_file+independent_segments",
+            "-hls_time", "2",                     # Segmentos de 2s (menos CPU)
+            "-hls_list_size", "4",
+            "-hls_flags", "delete_segments+append_list+omit_endlist",
             "-hls_segment_type", "mpegts",
             "-hls_segment_filename", str(stream_dir / "s%d.ts"),
-            "-hls_start_number_source", "epoch",
             str(output_path)
         ])
         

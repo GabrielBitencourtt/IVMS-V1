@@ -204,13 +204,16 @@ class StreamManager:
             await self._start_with_reencode(stream_key, source_url, output_path, stream_dir)
     
     async def _cancel_watchdog(self, stream_key: str):
-        """Cancela watchdog de uma stream"""
+        """Cancela watchdog de uma stream de forma segura"""
         if stream_key in self.watchdog_tasks:
-            self.watchdog_tasks[stream_key].cancel()
-            try:
-                await self.watchdog_tasks[stream_key]
-            except asyncio.CancelledError:
-                pass
+            task = self.watchdog_tasks[stream_key]
+            if not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, RuntimeError):
+                    pass
+            del self.watchdog_tasks[stream_key]
     
     async def _try_start_with_copy(
         self,
@@ -431,10 +434,8 @@ class StreamManager:
     async def stop_stream(self, stream_key: str):
         """Para uma stream"""
         
-        # Cancelar watchdog
+        # Cancelar watchdog de forma segura
         await self._cancel_watchdog(stream_key)
-        if stream_key in self.watchdog_tasks:
-            del self.watchdog_tasks[stream_key]
         
         # Parar processo
         if stream_key in self.processes:

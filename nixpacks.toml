@@ -1,11 +1,17 @@
 # Nixpacks configuration for Railway
-# Adiciona FFmpeg ao ambiente
+# Python + FFmpeg
 
 [phases.setup]
-nixPkgs = ["ffmpeg-full", "python311"]
+nixPkgs = ["ffmpeg-full", "python311", "python311Packages.pip"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = ["python3.11 -m pip install --user -r requirements.txt"]
+
+[phases.build]
+cmds = []
 
 [start]
-cmd = "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"
+cmd = "python3.11 -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"
+
+[variables]
+PYTHONUNBUFFERED = "1"

@@ -54,11 +54,12 @@ class StreamManager:
             cmd.extend([
                 "-rtsp_transport", "tcp",       # TCP é mais estável para RTSP
                 "-rtsp_flags", "prefer_tcp",    # Preferir TCP
-                "-stimeout", "5000000",         # Timeout de 5 segundos (em microsegundos)
-                "-analyzeduration", "1000000",  # Tempo de análise do stream
-                "-probesize", "1000000",        # Tamanho do probe
-                "-fflags", "nobuffer+genpts",   # Sem buffer, gerar timestamps
+                "-timeout", "5000000",          # Timeout de conexão (microsegundos)
+                "-analyzeduration", "2000000",  # Tempo de análise do stream
+                "-probesize", "2000000",        # Tamanho do probe
+                "-fflags", "+genpts+discardcorrupt",  # Gerar timestamps, descartar corrompidos
                 "-flags", "low_delay",          # Baixa latência
+                "-max_delay", "500000",         # Max delay 0.5s
             ])
         elif is_rtmp:
             cmd.extend([

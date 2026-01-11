@@ -32,19 +32,26 @@ class StreamManager:
         
         cmd = ["ffmpeg", "-y"]
         
-        # Parâmetros de input para baixa latência
-        cmd.extend([
-            "-fflags", "nobuffer+genpts+discardcorrupt",
-            "-flags", "low_delay",
-        ])
-        
+        # Parâmetros de input - similar ao OpenCV VideoCapture
+        # que usa FFmpeg internamente com configurações padrão
         if is_rtsp:
             cmd.extend([
-                "-rtsp_transport", "tcp",
+                "-rtsp_transport", "tcp",          # TCP mais confiável
                 "-rtsp_flags", "prefer_tcp",
-                "-timeout", "10000000",
-                "-analyzeduration", "2000000",
-                "-probesize", "2000000",
+                "-timeout", "10000000",            # 10s timeout conexão
+                "-stimeout", "10000000",           # 10s socket timeout
+                "-reorder_queue_size", "500",      # Buffer para reordenar pacotes
+                "-max_delay", "500000",            # Max delay 500ms
+                "-analyzeduration", "3000000",     # 3s para analisar stream
+                "-probesize", "3000000",           # 3MB para probe
+                "-fflags", "+genpts+discardcorrupt+nobuffer",
+                "-flags", "low_delay",
+            ])
+        else:
+            # RTMP usa configurações mais simples
+            cmd.extend([
+                "-fflags", "nobuffer+genpts+discardcorrupt",
+                "-flags", "low_delay",
             ])
         
         cmd.extend(["-i", source_url])

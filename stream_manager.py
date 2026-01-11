@@ -37,7 +37,7 @@ class StreamManager:
             cmd.extend([
                 "-rtsp_transport", "tcp",
                 "-rtsp_flags", "prefer_tcp",
-                "-timeout", "10000000",            # 10s timeout
+                "-timeout", "10000000",
                 "-reorder_queue_size", "500",
                 "-max_delay", "500000",
                 "-analyzeduration", "3000000",
@@ -45,7 +45,7 @@ class StreamManager:
                 "-fflags", "+genpts+discardcorrupt+igndts",
                 "-flags", "low_delay",
                 "-avoid_negative_ts", "make_zero",
-                "-use_wallclock_as_timestamps", "1",  # Importante para live
+                "-use_wallclock_as_timestamps", "1",
             ])
         else:
             cmd.extend([
@@ -54,9 +54,6 @@ class StreamManager:
                 "-avoid_negative_ts", "make_zero",
                 "-use_wallclock_as_timestamps", "1",
             ])
-        
-        # Opção para reconexão automática (apenas funciona com algumas versões)
-        cmd.extend(["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"])
         
         cmd.extend(["-i", source_url])
         

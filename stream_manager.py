@@ -42,22 +42,64 @@ class StreamManager:
         # Comando FFmpeg para converter RTSP/RTMP → HLS
         output_path = stream_dir / "index.m3u8"
         
-        cmd = [
-            "ffmpeg",
-            "-rtsp_transport", "tcp",      # Usar TCP para RTSP (mais estável)
-            "-i", source_url,               # URL de entrada
+        # Detectar protocolo e configurar parâmetros específicos
+        is_rtsp = source_url.lower().startswith("rtsp://")
+        is_rtmp = source_url.lower().startswith("rtmp://")
+        
+        # Construir comando base
+        cmd = ["ffmpeg", "-y"]  # -y para sobrescrever arquivos
+        
+        # Parâmetros específicos por protocolo
+        if is_rtsp:
+            cmd.extend([
+                "-rtsp_transport", "tcp",       # TCP é mais estável para RTSP
+                "-rtsp_flags", "prefer_tcp",    # Preferir TCP
+                "-stimeout", "5000000",         # Timeout de 5 segundos (em microsegundos)
+                "-analyzeduration", "1000000",  # Tempo de análise do stream
+                "-probesize", "1000000",        # Tamanho do probe
+                "-fflags", "nobuffer+genpts",   # Sem buffer, gerar timestamps
+                "-flags", "low_delay",          # Baixa latência
+            ])
+        elif is_rtmp:
+            cmd.extend([
+                "-fflags", "nobuffer+genpts",   # Sem buffer, gerar timestamps
+                "-flags", "low_delay",          # Baixa latência
+            ])
+        else:
+            # Protocolo genérico (http, etc)
+            cmd.extend([
+                "-fflags", "nobuffer+genpts",
+            ])
+        
+        # Input URL
+        cmd.extend(["-i", source_url])
+        
+        # Parâmetros de codificação
+        cmd.extend([
             "-c:v", "libx264",              # Codec de vídeo
             "-preset", "ultrafast",         # Preset rápido para baixa latência
             "-tune", "zerolatency",         # Otimizar para latência
+            "-profile:v", "baseline",       # Perfil compatível com mais players
+            "-level", "3.0",                # Nível de compatibilidade
+            "-pix_fmt", "yuv420p",          # Formato de pixel compatível
+            "-r", "25",                     # Frame rate
+            "-g", "50",                     # GOP size (2 segundos)
+            "-sc_threshold", "0",           # Desabilitar detecção de cena
+            "-b:v", "1500k",                # Bitrate de vídeo
+            "-maxrate", "1500k",            # Max bitrate
+            "-bufsize", "3000k",            # Buffer size
             "-c:a", "aac",                  # Codec de áudio
             "-ar", "44100",                 # Sample rate
+            "-b:a", "128k",                 # Bitrate de áudio
+            "-ac", "2",                     # 2 canais de áudio
             "-f", "hls",                    # Formato de saída
             "-hls_time", "2",               # Duração de cada segmento (segundos)
             "-hls_list_size", "5",          # Número de segmentos na playlist
-            "-hls_flags", "delete_segments+append_list",  # Limpar segmentos antigos
+            "-hls_flags", "delete_segments+append_list+independent_segments",
+            "-hls_segment_type", "mpegts",  # Tipo de segmento
             "-hls_segment_filename", str(stream_dir / "segment_%03d.ts"),
             str(output_path)
-        ]
+        ])
         
         print(f"🎬 Starting stream: {stream_key}")
         print(f"📡 Source: {source_url}")

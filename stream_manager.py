@@ -109,31 +109,33 @@ class StreamManager:
                 "-bsf:v", "h264_mp4toannexb",
             ])
         else:
-            # Re-encoding SUPER LEVE para servidores fracos
+            # Re-encoding OTIMIZADO para Railway 8 vCPUs / 8GB RAM
             cmd.extend([
                 "-c:v", "libx264",
-                "-preset", "superfast",           # Mais rápido que ultrafast em alguns casos
+                "-preset", "fast",                # Melhor qualidade que superfast
                 "-tune", "zerolatency",
-                "-profile:v", "baseline",
-                "-level", "3.0",
+                "-profile:v", "main",             # Melhor compressão
+                "-level", "4.0",
                 "-pix_fmt", "yuv420p",
-                "-vf", "scale=640:-2",            # Escala para 640px largura (MUITO mais leve)
-                "-r", "12",                       # 12 fps é suficiente para vigilância
-                "-g", "24",                       # Keyframe a cada 2s
-                "-keyint_min", "24",
+                "-vf", "scale=1280:-2",           # 720p - boa qualidade
+                "-r", "25",                       # 25 fps fluido
+                "-g", "50",                       # GOP de 2s
+                "-keyint_min", "25",
                 "-sc_threshold", "0",
-                "-b:v", "400k",                   # Bitrate menor
-                "-maxrate", "500k",
-                "-bufsize", "800k",
-                "-an",
-                "-threads", "1",                  # Limitar threads (menos CPU)
+                "-b:v", "1500k",                  # Bitrate bom para 720p
+                "-maxrate", "2000k",
+                "-bufsize", "3000k",
+                "-c:a", "aac",                    # Incluir áudio
+                "-b:a", "96k",
+                "-ar", "44100",
+                "-threads", "4",                  # Usar 4 threads (metade dos vCPUs)
             ])
         
-        # HLS com segmentos maiores = menos overhead
+        # HLS com segmentos menores = menos latência
         cmd.extend([
             "-f", "hls",
-            "-hls_time", "2",                     # Segmentos de 2s (menos CPU)
-            "-hls_list_size", "4",
+            "-hls_time", "1",                     # Segmentos de 1s (menos latência)
+            "-hls_list_size", "5",
             "-hls_flags", "delete_segments+append_list+omit_endlist",
             "-hls_segment_type", "mpegts",
             "-hls_segment_filename", str(stream_dir / "s%d.ts"),

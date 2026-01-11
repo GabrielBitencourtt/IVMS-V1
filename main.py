@@ -160,7 +160,7 @@ async def delete_stream(stream_key: str):
 
 @app.get("/hls/{stream_key}.m3u8")
 async def get_playlist(stream_key: str):
-    """Retorna a playlist HLS (.m3u8)"""
+    """Retorna a playlist HLS (.m3u8) com paths corrigidos"""
     playlist_path = HLS_DIR / stream_key / "index.m3u8"
     
     if not playlist_path.exists():
@@ -169,8 +169,20 @@ async def get_playlist(stream_key: str):
     async with aiofiles.open(playlist_path, mode='r') as f:
         content = await f.read()
     
+    # Ajustar paths dos segmentos para incluir o stream_key
+    # Converte "segment_001.ts" para "{stream_key}/segment_001.ts"
+    lines = content.split('\n')
+    adjusted_lines = []
+    for line in lines:
+        if line.endswith('.ts'):
+            adjusted_lines.append(f"{stream_key}/{line}")
+        else:
+            adjusted_lines.append(line)
+    
+    adjusted_content = '\n'.join(adjusted_lines)
+    
     return Response(
-        content=content,
+        content=adjusted_content,
         media_type="application/vnd.apple.mpegurl",
         headers={
             "Cache-Control": "no-cache, no-store, must-revalidate",

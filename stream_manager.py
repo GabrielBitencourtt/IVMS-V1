@@ -19,6 +19,72 @@ class StreamManager:
         self.streams: Dict[str, dict] = {}
         self.processes: Dict[str, subprocess.Popen] = {}
     
+    def _build_ffmpeg_command(
+        self,
+        source_url: str,
+        output_path: Path,
+        stream_dir: Path,
+        use_copy: bool = False
+    ) -> list:
+        """Constrói comando FFmpeg com configurações otimizadas"""
+        
+        is_rtsp = source_url.lower().startswith("rtsp://")
+        
+        cmd = ["ffmpeg", "-y"]
+        
+        # Parâmetros de input para baixa latência
+        cmd.extend([
+            "-fflags", "nobuffer+genpts+discardcorrupt",
+            "-flags", "low_delay",
+        ])
+        
+        if is_rtsp:
+            cmd.extend([
+                "-rtsp_transport", "tcp",
+                "-rtsp_flags", "prefer_tcp",
+                "-timeout", "10000000",
+                "-analyzeduration", "2000000",
+                "-probesize", "2000000",
+            ])
+        
+        cmd.extend(["-i", source_url])
+        
+        if use_copy:
+            # Tentar copiar sem re-codificar (mais rápido, menor latência)
+            cmd.extend([
+                "-c:v", "copy",
+                "-an",
+            ])
+        else:
+            # Re-codificar (funciona com qualquer codec de entrada)
+            cmd.extend([
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-profile:v", "baseline",
+                "-level", "3.0",
+                "-pix_fmt", "yuv420p",
+                "-r", "15",                  # 15 fps para menor carga
+                "-g", "30",                  # GOP de 2 segundos
+                "-b:v", "1000k",
+                "-maxrate", "1000k",
+                "-bufsize", "500k",
+                "-an",                       # Sem áudio
+            ])
+        
+        # Parâmetros HLS
+        cmd.extend([
+            "-f", "hls",
+            "-hls_time", "2",
+            "-hls_list_size", "4",
+            "-hls_flags", "delete_segments+append_list",
+            "-hls_segment_type", "mpegts",
+            "-hls_segment_filename", str(stream_dir / "segment_%03d.ts"),
+            str(output_path)
+        ])
+        
+        return cmd
+    
     async def start_stream(
         self,
         stream_key: str,
@@ -27,8 +93,17 @@ class StreamManager:
     ):
         """Inicia conversão de RTSP/RTMP para HLS"""
         
+        # Se já existe, não iniciar novamente
+        if stream_key in self.processes:
+            process = self.processes[stream_key]
+            if process.poll() is None:  # Ainda rodando
+                print(f"⚠️ Stream {stream_key} já está rodando")
+                return
+        
         # Criar diretório para esta stream
         stream_dir = self.hls_dir / stream_key
+        if stream_dir.exists():
+            shutil.rmtree(stream_dir, ignore_errors=True)
         stream_dir.mkdir(parents=True, exist_ok=True)
         
         # Registrar stream
@@ -39,56 +114,92 @@ class StreamManager:
             "dir": str(stream_dir)
         }
         
-        # Comando FFmpeg para converter RTSP/RTMP → HLS
         output_path = stream_dir / "index.m3u8"
-        
-        # Detectar protocolo e configurar parâmetros específicos
-        is_rtsp = source_url.lower().startswith("rtsp://")
-        is_rtmp = source_url.lower().startswith("rtmp://")
-        
-        # Construir comando base - otimizado para baixa latência
-        cmd = ["ffmpeg", "-y"]  # -y para sobrescrever arquivos
-        
-        # Parâmetros comuns para baixa latência
-        cmd.extend([
-            "-fflags", "nobuffer+genpts+discardcorrupt",
-            "-flags", "low_delay",
-        ])
-        
-        # Parâmetros específicos por protocolo
-        if is_rtsp:
-            cmd.extend([
-                "-rtsp_transport", "tcp",
-                "-rtsp_flags", "prefer_tcp",
-                "-timeout", "5000000",
-                "-analyzeduration", "1000000",
-                "-probesize", "1000000",
-            ])
-        
-        # Input URL
-        cmd.extend(["-i", source_url])
-        
-        # Parâmetros de codificação - usar copy para baixa latência
-        # Se a câmera já envia H.264, não precisa re-codificar
-        cmd.extend([
-            "-vsync", "0",
-            "-copyts",
-            "-vcodec", "copy",           # Copiar vídeo sem re-codificar
-            "-an",                        # Sem áudio para menor latência
-            "-f", "hls",
-            "-hls_time", "1",             # Segmentos de 1 segundo
-            "-hls_list_size", "3",        # Manter apenas 3 segmentos
-            "-hls_flags", "delete_segments+append_list+omit_endlist",
-            "-hls_segment_type", "mpegts",
-            "-hls_segment_filename", str(stream_dir / "segment_%03d.ts"),
-            str(output_path)
-        ])
         
         print(f"🎬 Starting stream: {stream_key}")
         print(f"📡 Source: {source_url}")
         
+        # Primeiro tenta com copy (mais rápido)
+        # Se falhar em 5 segundos, usa re-codificação
+        success = await self._try_start_with_copy(stream_key, source_url, output_path, stream_dir)
+        
+        if not success:
+            print(f"⚠️ Copy failed, trying with re-encoding...")
+            await self._start_with_reencode(stream_key, source_url, output_path, stream_dir)
+    
+    async def _try_start_with_copy(
+        self,
+        stream_key: str,
+        source_url: str,
+        output_path: Path,
+        stream_dir: Path
+    ) -> bool:
+        """Tenta iniciar com copy, retorna False se falhar"""
+        
+        cmd = self._build_ffmpeg_command(source_url, output_path, stream_dir, use_copy=True)
+        print(f"🔄 Trying copy mode: {' '.join(cmd[:10])}...")
+        
         try:
-            # Iniciar processo FFmpeg
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=os.setsid if os.name != 'nt' else None
+            )
+            
+            # Aguardar até 8 segundos para ver se cria o arquivo m3u8
+            for i in range(16):
+                await asyncio.sleep(0.5)
+                
+                # Verificar se processo ainda está rodando
+                if process.poll() is not None:
+                    stderr = process.stderr.read().decode() if process.stderr else ""
+                    print(f"❌ Copy mode failed early: {stderr[-300:]}")
+                    return False
+                
+                # Verificar se m3u8 foi criado
+                if output_path.exists() and output_path.stat().st_size > 0:
+                    print(f"✅ Copy mode working!")
+                    self.processes[stream_key] = process
+                    self.streams[stream_key]["status"] = "running"
+                    self.streams[stream_key]["pid"] = process.pid
+                    self.streams[stream_key]["mode"] = "copy"
+                    asyncio.create_task(self._monitor_process(stream_key, process))
+                    return True
+            
+            # Timeout - matar processo e tentar re-encode
+            print(f"⚠️ Copy mode timeout, no m3u8 created")
+            try:
+                if os.name != 'nt':
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                else:
+                    process.kill()
+            except:
+                pass
+            return False
+            
+        except Exception as e:
+            print(f"❌ Error in copy mode: {e}")
+            return False
+    
+    async def _start_with_reencode(
+        self,
+        stream_key: str,
+        source_url: str,
+        output_path: Path,
+        stream_dir: Path
+    ):
+        """Inicia com re-codificação (fallback)"""
+        
+        # Limpar diretório
+        if stream_dir.exists():
+            shutil.rmtree(stream_dir, ignore_errors=True)
+        stream_dir.mkdir(parents=True, exist_ok=True)
+        
+        cmd = self._build_ffmpeg_command(source_url, output_path, stream_dir, use_copy=False)
+        print(f"🔄 Starting with re-encode: {' '.join(cmd[:10])}...")
+        
+        try:
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -99,10 +210,10 @@ class StreamManager:
             self.processes[stream_key] = process
             self.streams[stream_key]["status"] = "running"
             self.streams[stream_key]["pid"] = process.pid
+            self.streams[stream_key]["mode"] = "reencode"
             
-            print(f"✅ Stream started: {stream_key} (PID: {process.pid})")
+            print(f"✅ Stream started with re-encode: {stream_key} (PID: {process.pid})")
             
-            # Monitorar processo em background
             asyncio.create_task(self._monitor_process(stream_key, process))
             
         except Exception as e:
@@ -112,6 +223,10 @@ class StreamManager:
     
     async def _monitor_process(self, stream_key: str, process: subprocess.Popen):
         """Monitora o processo FFmpeg e atualiza status"""
+        
+        # Aguardar um pouco antes de começar a monitorar
+        await asyncio.sleep(10)
+        
         while True:
             await asyncio.sleep(5)
             
@@ -127,7 +242,6 @@ class StreamManager:
                         self.streams[stream_key]["status"] = "stopped"
                     else:
                         self.streams[stream_key]["status"] = "error"
-                        # Capturar erro
                         stderr = process.stderr.read().decode() if process.stderr else ""
                         self.streams[stream_key]["error"] = stderr[-500:] if stderr else f"Exit code: {returncode}"
                         print(f"❌ Stream {stream_key} failed: {self.streams[stream_key]['error']}")
@@ -139,17 +253,14 @@ class StreamManager:
             process = self.processes[stream_key]
             
             try:
-                # Tentar terminar graciosamente
                 if os.name != 'nt':
                     os.killpg(os.getpgid(process.pid), signal.SIGTERM)
                 else:
                     process.terminate()
                 
-                # Aguardar até 5 segundos
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    # Forçar kill
                     if os.name != 'nt':
                         os.killpg(os.getpgid(process.pid), signal.SIGKILL)
                     else:
@@ -162,7 +273,6 @@ class StreamManager:
             
             del self.processes[stream_key]
         
-        # Limpar arquivos
         if stream_key in self.streams:
             stream_dir = Path(self.streams[stream_key].get("dir", ""))
             if stream_dir.exists():

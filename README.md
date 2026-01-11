@@ -44,7 +44,7 @@ http://SEU_IP:8080/hls/STREAM_KEY.m3u8
 ## Comandos úteis
 
 ```bash
-# Ver logs;
+# Ver logs.
 docker-compose logs -f
 
 # Parar servidor

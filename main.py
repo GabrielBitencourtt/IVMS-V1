@@ -98,7 +98,43 @@ async def health():
     }
 
 
-@app.get("/debug/{stream_key}")
+@app.get("/debug/hls")
+async def debug_hls_dir():
+    """Lista todos os diretórios e arquivos HLS - útil para debug"""
+    import os as os_module
+    import time
+    
+    result = {
+        "hls_base_dir": str(HLS_DIR),
+        "hls_dir_exists": HLS_DIR.exists(),
+        "streams": {}
+    }
+    
+    if HLS_DIR.exists():
+        now = time.time()
+        for item in HLS_DIR.iterdir():
+            if item.is_dir():
+                files = []
+                for f in item.iterdir():
+                    stat = os_module.stat(f)
+                    files.append({
+                        "name": f.name,
+                        "size": stat.st_size,
+                        "age_seconds": round(now - stat.st_mtime, 1)
+                    })
+                result["streams"][item.name] = {
+                    "file_count": len(files),
+                    "files": sorted(files, key=lambda x: x["age_seconds"])
+                }
+            else:
+                # Arquivo na raiz (não deveria existir com hls_nested on)
+                result["root_files"] = result.get("root_files", [])
+                result["root_files"].append(item.name)
+    
+    return result
+
+
+@app.get("/debug/stream/{stream_key}")
 async def debug_stream(stream_key: str):
     """Debug endpoint para verificar status de um stream"""
     import os as os_module

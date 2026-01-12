@@ -18,6 +18,7 @@ def install_requirements():
     deps = [
         ("pystray", "pystray"),
         ("PIL", "Pillow"),
+        ("websockets", "websockets"),
     ]
     
     for module_name, pip_name in deps:
@@ -78,6 +79,14 @@ def build_executable():
         "--hidden-import=PIL",
         "--hidden-import=PIL.Image",
         "--hidden-import=PIL.ImageDraw",
+        # WebSocket e bridge
+        "--hidden-import=websockets",
+        "--hidden-import=websockets.server",
+        "--hidden-import=websockets.client",
+        # Módulos do projeto
+        f"--add-data={os.path.join(base_dir, 'stream_bridge.py')}{os.pathsep}.",
+        f"--add-data={os.path.join(base_dir, 'websocket_server.py')}{os.pathsep}.",
+        f"--add-data={os.path.join(base_dir, 'ffmpeg_installer.py')}{os.pathsep}.",
     ]
     
     # Opções específicas por plataforma

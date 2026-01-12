@@ -1698,14 +1698,54 @@ def setup_autostart():
         print(f"⚠ Erro: {e}")
 
 
+def run_with_bridge():
+    """Executa o app com o servidor WebSocket de bridge em background"""
+    import asyncio
+    
+    # Tenta importar o servidor WebSocket
+    try:
+        from websocket_server import BridgeWebSocketServer
+        BRIDGE_AVAILABLE = True
+    except ImportError:
+        BRIDGE_AVAILABLE = False
+        logger.warning("websocket_server não disponível - bridge desabilitado")
+    
+    # Thread para rodar o servidor WebSocket
+    def run_ws_server():
+        if not BRIDGE_AVAILABLE:
+            return
+        
+        try:
+            server = BridgeWebSocketServer()
+            asyncio.run(server.start())
+        except Exception as e:
+            logger.error(f"Erro no servidor WebSocket: {e}")
+    
+    # Inicia servidor WebSocket em thread separada
+    if BRIDGE_AVAILABLE:
+        ws_thread = threading.Thread(target=run_ws_server, daemon=True)
+        ws_thread.start()
+        logger.info("✓ Bridge WebSocket iniciado em ws://127.0.0.1:8765")
+    
+    # Executa a GUI principal
+    run_gui()
+
+
 if __name__ == '__main__':
     if len(sys.argv) > 1:
         cmd = sys.argv[1].lower()
         if cmd == '--install-autostart':
             setup_autostart()
+        elif cmd == '--bridge-only':
+            # Roda apenas o servidor WebSocket (sem GUI)
+            from websocket_server import run_server
+            run_server()
         elif cmd == '--help':
-            print("Camera Scanner Agent\n  --install-autostart  Inicia com o sistema\n  --help  Mostra ajuda")
+            print("Camera Scanner Agent + Bridge")
+            print("  --install-autostart  Inicia com o sistema")
+            print("  --bridge-only        Roda apenas o servidor de bridge (sem GUI)")
+            print("  --help               Mostra ajuda")
         else:
             print(f"Comando desconhecido: {cmd}")
     else:
-        run_gui()
+        run_with_bridge()

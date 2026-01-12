@@ -31,8 +31,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copiar código
 COPY . .
 
-# Criar diretório HLS e tornar script executável
+# Criar diretório HLS com permissões corretas e tornar script executável
 RUN mkdir -p /tmp/hls && \
+    chmod 777 /tmp/hls && \
     chmod +x start.sh
 
 # Expor portas (HTTP + RTMP)

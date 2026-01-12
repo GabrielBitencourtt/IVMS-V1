@@ -7,7 +7,7 @@ import os
 import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
@@ -275,6 +275,72 @@ async def get_segment(stream_key: str, segment: str):
             "Access-Control-Allow-Origin": "*",
         }
     )
+
+
+# ============ RTMP Push Callbacks (nginx-rtmp) ============
+
+@app.post("/rtmp/on_publish")
+async def rtmp_on_publish(request: Request):
+    """
+    Callback chamado pelo nginx-rtmp quando um stream começa.
+    nginx-rtmp envia dados como form-urlencoded.
+    """
+    try:
+        form = await request.form()
+        stream_key = form.get("name", "")
+        app_name = form.get("app", "")
+        
+        print(f"📡 RTMP on_publish received: app={app_name}, name={stream_key}")
+        
+        if not stream_key:
+            print("⚠️ No stream key received")
+            # Retornar 200 mesmo assim para não bloquear
+            return Response(status_code=200)
+        
+        # Registrar stream no manager (nginx já gera HLS automaticamente)
+        base_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "localhost:8080")
+        
+        stream_manager.streams[stream_key] = {
+            "name": stream_key,
+            "source_url": f"rtmp://localhost/live/{stream_key}",
+            "status": "running",
+            "mode": "rtmp-push",
+            "dir": str(HLS_DIR / stream_key),
+            "start_time": __import__('time').time(),
+            "restart_count": 0,
+        }
+        
+        print(f"✅ Stream registered: {stream_key}")
+        
+        # Retornar 200 OK para permitir o stream
+        return Response(status_code=200)
+        
+    except Exception as e:
+        print(f"❌ Error in on_publish: {e}")
+        # Retornar 200 mesmo em erro para não bloquear stream
+        return Response(status_code=200)
+
+
+@app.post("/rtmp/on_publish_done")
+async def rtmp_on_publish_done(request: Request):
+    """
+    Callback chamado pelo nginx-rtmp quando um stream termina.
+    """
+    try:
+        form = await request.form()
+        stream_key = form.get("name", "")
+        
+        print(f"🛑 RTMP stream ended: {stream_key}")
+        
+        # Atualizar status no manager
+        if stream_key and stream_key in stream_manager.streams:
+            stream_manager.streams[stream_key]["status"] = "stopped"
+        
+        return Response(status_code=200)
+        
+    except Exception as e:
+        print(f"❌ Error in on_publish_done: {e}")
+        return Response(status_code=200)
 
 
 # ============ Para desenvolvimento local ============

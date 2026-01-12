@@ -1,8 +1,9 @@
 #!/bin/bash
 set -e
 
-# Criar diretórios necessários
+# Criar diretórios necessários com permissões corretas
 mkdir -p /tmp/hls
+chmod 777 /tmp/hls
 
 # Iniciar nginx-rtmp em background
 echo "🎬 Starting nginx-rtmp server on port 1935..."

@@ -102,15 +102,40 @@ async def health():
 async def debug_stream(stream_key: str):
     """Debug endpoint para verificar status de um stream"""
     import os as os_module
+    import time
     
     stream_info = stream_manager.get_stream_status(stream_key)
     stream_dir = HLS_DIR / stream_key
     
     files = []
     playlist_content = None
+    newest_segment_age = None
+    process_running = False
+    
+    # Verificar se processo está rodando
+    if stream_key in stream_manager.processes:
+        process = stream_manager.processes[stream_key]
+        process_running = process.poll() is None
     
     if stream_dir.exists():
-        files = os_module.listdir(stream_dir)
+        all_files = os_module.listdir(stream_dir)
+        now = time.time()
+        
+        for f in all_files:
+            file_path = stream_dir / f
+            stat = os_module.stat(file_path)
+            age = now - stat.st_mtime
+            files.append({
+                "name": f,
+                "size": stat.st_size,
+                "age_seconds": round(age, 1)
+            })
+            
+            # Track newest .ts segment
+            if f.endswith('.ts'):
+                if newest_segment_age is None or age < newest_segment_age:
+                    newest_segment_age = age
+        
         playlist_path = stream_dir / "index.m3u8"
         if playlist_path.exists():
             async with aiofiles.open(playlist_path, mode='r') as f:
@@ -119,9 +144,15 @@ async def debug_stream(stream_key: str):
     return {
         "stream_key": stream_key,
         "stream_info": stream_info,
+        "process_running": process_running,
         "hls_dir_exists": stream_dir.exists(),
-        "files": files,
-        "playlist_content": playlist_content
+        "files": sorted(files, key=lambda x: x["age_seconds"]),
+        "newest_segment_age_seconds": round(newest_segment_age, 1) if newest_segment_age else None,
+        "playlist_content": playlist_content,
+        "diagnosis": "OK - FFmpeg generating segments" if (process_running and newest_segment_age and newest_segment_age < 10) 
+                     else "STALLED - No new segments" if (newest_segment_age and newest_segment_age > 10)
+                     else "DEAD - Process not running" if not process_running
+                     else "STARTING - Waiting for segments"
     }
 
 
@@ -135,8 +166,10 @@ async def create_stream(stream: StreamCreate, background_tasks: BackgroundTasks)
     2. Converter para HLS usando FFmpeg
     3. Servir os arquivos HLS
     """
+    # Se já existe, parar antes de reiniciar
     if stream.stream_key in stream_manager.streams:
-        raise HTTPException(status_code=400, detail="Stream já existe")
+        print(f"⚠️ Stream {stream.stream_key} já existe, parando para reiniciar...")
+        await stream_manager.stop_stream(stream.stream_key)
     
     # Inicia conversão em background
     background_tasks.add_task(
@@ -187,7 +220,9 @@ async def delete_stream(stream_key: str):
 
 @app.get("/hls/{stream_key}.m3u8")
 async def get_playlist(stream_key: str):
-    """Retorna a playlist HLS (.m3u8) com paths corrigidos"""
+    """Retorna a playlist HLS (.m3u8) com paths corrigidos - ANTI-CACHE"""
+    import time
+    
     playlist_path = HLS_DIR / stream_key / "index.m3u8"
     
     if not playlist_path.exists():
@@ -197,12 +232,12 @@ async def get_playlist(stream_key: str):
         content = await f.read()
     
     # Ajustar paths dos segmentos para incluir o stream_key
-    # Converte "segment_001.ts" para "{stream_key}/segment_001.ts"
     lines = content.split('\n')
     adjusted_lines = []
     for line in lines:
         if line.endswith('.ts'):
-            adjusted_lines.append(f"{stream_key}/{line}")
+            # Adicionar timestamp para evitar cache de segmentos
+            adjusted_lines.append(f"{stream_key}/{line}?_={int(time.time() * 1000)}")
         else:
             adjusted_lines.append(line)
     
@@ -212,16 +247,21 @@ async def get_playlist(stream_key: str):
         content=adjusted_content,
         media_type="application/vnd.apple.mpegurl",
         headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Access-Control-Allow-Origin": "*"
+            "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Access-Control-Allow-Origin": "*",
+            "X-Content-Type-Options": "nosniff",
         }
     )
 
 
 @app.get("/hls/{stream_key}/{segment}")
 async def get_segment(stream_key: str, segment: str):
-    """Retorna um segmento de vídeo (.ts)"""
-    segment_path = HLS_DIR / stream_key / segment
+    """Retorna um segmento de vídeo (.ts) - permite cache curto"""
+    # Remover query string do nome do segmento se existir
+    segment_name = segment.split('?')[0]
+    segment_path = HLS_DIR / stream_key / segment_name
     
     if not segment_path.exists():
         raise HTTPException(status_code=404, detail="Segmento não encontrado")
@@ -230,8 +270,9 @@ async def get_segment(stream_key: str, segment: str):
         segment_path,
         media_type="video/mp2t",
         headers={
-            "Cache-Control": "max-age=3600",
-            "Access-Control-Allow-Origin": "*"
+            # Segmentos podem ter cache curto (já são imutáveis uma vez criados)
+            "Cache-Control": "public, max-age=2",
+            "Access-Control-Allow-Origin": "*",
         }
     )
 

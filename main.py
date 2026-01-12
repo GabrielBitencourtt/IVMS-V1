@@ -161,26 +161,51 @@ async def create_stream(stream: StreamCreate, background_tasks: BackgroundTasks)
     """
     Registra e inicia uma nova stream.
     
-    O servidor irá:
-    1. Conectar na source_url (RTSP/RTMP da câmera)
-    2. Converter para HLS usando FFmpeg
-    3. Servir os arquivos HLS
+    Para RTMP push (source_url vazia): apenas registra e aguarda stream via nginx-rtmp
+    Para RTSP/RTMP pull (source_url preenchida): inicia FFmpeg para conversão
     """
+    base_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "localhost:8080")
+    protocol = "https" if "railway" in base_url else "http"
+    
+    # Se source_url está vazia, é um stream RTMP push (OBS/câmera envia diretamente)
+    if not stream.source_url or stream.source_url.strip() == "":
+        print(f"📡 RTMP push mode: registrando {stream.stream_key} (aguardando conexão)")
+        
+        # Criar diretório HLS para nginx-rtmp usar
+        stream_dir = HLS_DIR / stream.stream_key
+        stream_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Registrar stream como "waiting" - nginx-rtmp vai atualizar quando receber
+        stream_manager.streams[stream.stream_key] = {
+            "name": stream.name,
+            "source_url": "",
+            "status": "waiting",  # Aguardando conexão RTMP
+            "mode": "rtmp-push",
+            "dir": str(stream_dir),
+            "start_time": __import__('time').time(),
+            "restart_count": 0,
+        }
+        
+        return StreamInfo(
+            stream_key=stream.stream_key,
+            name=stream.name,
+            source_url="",
+            status="waiting",
+            hls_url=f"{protocol}://{base_url}/hls/{stream.stream_key}.m3u8"
+        )
+    
     # Se já existe, parar antes de reiniciar
     if stream.stream_key in stream_manager.streams:
         print(f"⚠️ Stream {stream.stream_key} já existe, parando para reiniciar...")
         await stream_manager.stop_stream(stream.stream_key)
     
-    # Inicia conversão em background
+    # Inicia conversão FFmpeg em background
     background_tasks.add_task(
         stream_manager.start_stream,
         stream.stream_key,
         stream.source_url,
         stream.name
     )
-    
-    base_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "localhost:8080")
-    protocol = "https" if "railway" in base_url else "http"
     
     return StreamInfo(
         stream_key=stream.stream_key,

@@ -88,8 +88,7 @@ class StreamManager:
             cmd.extend([
                 "-rtsp_transport", "tcp",
                 "-rtsp_flags", "prefer_tcp",
-                "-stimeout", "5000000",
-                "-timeout", "5000000",
+                "-timeout", "5000000",           # 5 segundos timeout
                 "-buffer_size", "1024000",
                 "-max_delay", "500000",
                 "-reorder_queue_size", "500",

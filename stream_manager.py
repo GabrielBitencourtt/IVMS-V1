@@ -130,16 +130,15 @@ class StreamManager:
                 "-threads", "2",
             ])
         
-        # HLS OTIMIZADO para streaming contínuo em tempo real
+        # HLS OTIMIZADO para sincronização entre câmeras
         cmd.extend([
             "-f", "hls",
             "-hls_time", "1",                     # Segmentos de 1 segundo
-            "-hls_list_size", "3",                # Apenas 3 segmentos na playlist
-            "-hls_flags", "delete_segments+independent_segments",  # DELETAR segmentos antigos
+            "-hls_list_size", "2",                # APENAS 2 segmentos = menos divergência
+            "-hls_flags", "delete_segments+independent_segments+program_date_time",
             "-hls_segment_type", "mpegts",
-            "-hls_start_number_source", "datetime",
-            "-start_number", "1",
-            "-hls_segment_filename", str(stream_dir / "seg_%03d.ts"),
+            "-hls_start_number_source", "epoch",  # Baseado em timestamp real
+            "-hls_segment_filename", str(stream_dir / "seg_%d.ts"),
             str(output_path)
         ])
         

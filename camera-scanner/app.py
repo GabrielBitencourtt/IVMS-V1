@@ -24,10 +24,11 @@ import concurrent.futures
 # System tray support
 try:
     import pystray
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageTk
     TRAY_AVAILABLE = True
 except ImportError:
     TRAY_AVAILABLE = False
+    ImageTk = None
     print("⚠ pystray ou PIL não instalado. Ícone na bandeja do sistema não disponível.")
 
 # Configuração
@@ -2176,11 +2177,34 @@ def run_gui():
             center.place(relx=0.5, rely=0.5, anchor='center')
             
             # Logo
-            logo_frame = tk.Frame(center, bg=Theme.PRIMARY, width=80, height=80)
+            logo_frame = tk.Frame(center, bg=Theme.BG_DARK)
             logo_frame.pack(pady=(0, 24))
-            logo_frame.pack_propagate(False)
-            tk.Label(logo_frame, text="📹", font=(Theme.FONT_FAMILY, 36),
-                    bg=Theme.PRIMARY).place(relx=0.5, rely=0.5, anchor='center')
+            
+            # Tenta carregar a imagem do logo
+            try:
+                logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logo.png')
+                logger.info(f"Buscando logo em: {logo_path}")
+                if os.path.exists(logo_path) and ImageTk:
+                    logo_img = Image.open(logo_path)
+                    logo_img = logo_img.resize((120, 96), Image.Resampling.LANCZOS)
+                    self.logo_photo = ImageTk.PhotoImage(logo_img)
+                    tk.Label(logo_frame, image=self.logo_photo, bg=Theme.BG_DARK).pack()
+                    logger.info("Logo carregado com sucesso!")
+                else:
+                    logger.warning(f"Logo não encontrado em: {logo_path}")
+                    # Fallback para emoji se imagem não existir
+                    fallback = tk.Frame(logo_frame, bg=Theme.PRIMARY, width=80, height=80)
+                    fallback.pack()
+                    fallback.pack_propagate(False)
+                    tk.Label(fallback, text="📹", font=(Theme.FONT_FAMILY, 36),
+                            bg=Theme.PRIMARY).place(relx=0.5, rely=0.5, anchor='center')
+            except Exception as e:
+                logger.warning(f"Erro ao carregar logo: {e}")
+                fallback = tk.Frame(logo_frame, bg=Theme.PRIMARY, width=80, height=80)
+                fallback.pack()
+                fallback.pack_propagate(False)
+                tk.Label(fallback, text="📹", font=(Theme.FONT_FAMILY, 36),
+                        bg=Theme.PRIMARY).place(relx=0.5, rely=0.5, anchor='center')
             
             # Título
             tk.Label(center, text="Camera Scanner",
@@ -2393,15 +2417,35 @@ def run_gui():
             left_content.place(relx=0.5, rely=0.5, anchor='center')
             
             # Logo grande
-            logo_container = tk.Frame(left_content, bg=Theme.PRIMARY, width=100, height=100)
+            logo_container = tk.Frame(left_content, bg=Theme.BG_DARK)
             logo_container.pack(pady=(0, 32))
-            logo_container.pack_propagate(False)
             
-            # Canvas para logo arredondado
-            logo_canvas = tk.Canvas(logo_container, width=100, height=100, 
-                                   bg=Theme.PRIMARY, highlightthickness=0)
-            logo_canvas.pack()
-            logo_canvas.create_text(50, 50, text="📹", font=(Theme.FONT_FAMILY, 42))
+            # Tenta carregar a imagem do logo
+            try:
+                logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logo.png')
+                if os.path.exists(logo_path) and ImageTk:
+                    logo_img = Image.open(logo_path)
+                    logo_img = logo_img.resize((150, 120), Image.Resampling.LANCZOS)
+                    self.login_logo_photo = ImageTk.PhotoImage(logo_img)
+                    tk.Label(logo_container, image=self.login_logo_photo, bg=Theme.BG_DARK).pack()
+                else:
+                    # Fallback para canvas com emoji
+                    fallback = tk.Frame(logo_container, bg=Theme.PRIMARY, width=100, height=100)
+                    fallback.pack()
+                    fallback.pack_propagate(False)
+                    logo_canvas = tk.Canvas(fallback, width=100, height=100, 
+                                           bg=Theme.PRIMARY, highlightthickness=0)
+                    logo_canvas.pack()
+                    logo_canvas.create_text(50, 50, text="📹", font=(Theme.FONT_FAMILY, 42))
+            except Exception as e:
+                logger.warning(f"Erro ao carregar logo login: {e}")
+                fallback = tk.Frame(logo_container, bg=Theme.PRIMARY, width=100, height=100)
+                fallback.pack()
+                fallback.pack_propagate(False)
+                logo_canvas = tk.Canvas(fallback, width=100, height=100, 
+                                       bg=Theme.PRIMARY, highlightthickness=0)
+                logo_canvas.pack()
+                logo_canvas.create_text(50, 50, text="📹", font=(Theme.FONT_FAMILY, 42))
             
             # Título principal
             tk.Label(left_content, text="Camera Scanner",
@@ -2590,9 +2634,23 @@ def run_gui():
             logo_frame = tk.Frame(header_content, bg=Theme.BG_DARK)
             logo_frame.pack(side='left', pady=12)
             
-            tk.Label(logo_frame, text="📹",
-                    font=(Theme.FONT_FAMILY, 20),
-                    bg=Theme.BG_DARK, fg=Theme.PRIMARY).pack(side='left')
+            # Tenta carregar a imagem do logo no header
+            try:
+                logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logo.png')
+                if os.path.exists(logo_path) and ImageTk:
+                    logo_img = Image.open(logo_path)
+                    logo_img = logo_img.resize((50, 40), Image.Resampling.LANCZOS)
+                    self.header_logo_photo = ImageTk.PhotoImage(logo_img)
+                    tk.Label(logo_frame, image=self.header_logo_photo, bg=Theme.BG_DARK).pack(side='left')
+                else:
+                    tk.Label(logo_frame, text="📹",
+                            font=(Theme.FONT_FAMILY, 20),
+                            bg=Theme.BG_DARK, fg=Theme.PRIMARY).pack(side='left')
+            except Exception as e:
+                logger.warning(f"Erro ao carregar logo header: {e}")
+                tk.Label(logo_frame, text="📹",
+                        font=(Theme.FONT_FAMILY, 20),
+                        bg=Theme.BG_DARK, fg=Theme.PRIMARY).pack(side='left')
             
             tk.Label(logo_frame, text="Camera Scanner",
                     font=(Theme.FONT_FAMILY, 16, 'bold'),

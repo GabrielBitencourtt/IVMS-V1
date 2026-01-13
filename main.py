@@ -328,10 +328,19 @@ async def delete_stream(stream_key: str):
 
 @app.get("/hls/{stream_key}.m3u8")
 async def get_playlist(stream_key: str):
-    """Retorna a playlist HLS (.m3u8) com paths corrigidos - ANTI-CACHE"""
+    """Retorna a playlist HLS (.m3u8) com paths corrigidos - ANTI-CACHE
+    
+    IMPORTANTE: Este endpoint verifica se os arquivos HLS existem no disco,
+    independente do estado do stream_manager. Isso permite servir streams
+    que estão rodando mas cujo estado interno ficou dessincronizado.
+    """
     import time
     
     stream_dir = HLS_DIR / stream_key
+    
+    # Verificar se diretório existe primeiro
+    if not stream_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Diretório HLS não existe: {stream_key}")
     
     # Tentar encontrar playlist - pode ser index.m3u8 ou {stream_key}.m3u8
     playlist_path = None
@@ -344,21 +353,39 @@ async def get_playlist(stream_key: str):
             break
     
     # Se não encontrou por nome, procurar qualquer .m3u8
-    if not playlist_path and stream_dir.exists():
+    if not playlist_path:
         m3u8_files = list(stream_dir.glob("*.m3u8"))
         if m3u8_files:
             playlist_path = m3u8_files[0]
     
     if not playlist_path or not playlist_path.exists():
-        raise HTTPException(status_code=404, detail="Stream não encontrada ou ainda iniciando")
+        # Listar o que temos no diretório para debug
+        try:
+            files = list(stream_dir.iterdir())
+            file_names = [f.name for f in files]
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Playlist não encontrada. Arquivos no diretório: {file_names}"
+            )
+        except:
+            raise HTTPException(status_code=404, detail="Stream não encontrada ou ainda iniciando")
     
-    # Verificar idade da playlist - se muito antiga, stream provavelmente parou
+    # Verificar idade da playlist
     playlist_age = time.time() - playlist_path.stat().st_mtime
-    if playlist_age > 30:
-        # Playlist não foi atualizada em 30s - stream provavelmente morreu
+    
+    # Se playlist muito antiga (> 60s), provavelmente stream morreu
+    # Mas verificar também se tem segmentos recentes
+    newest_segment_age = None
+    ts_files = list(stream_dir.glob("*.ts"))
+    if ts_files:
+        newest_ts = max(ts_files, key=lambda f: f.stat().st_mtime)
+        newest_segment_age = time.time() - newest_ts.stat().st_mtime
+    
+    # Stream considerado morto se playlist E segmentos estão velhos
+    if playlist_age > 60 and (newest_segment_age is None or newest_segment_age > 30):
         raise HTTPException(
             status_code=503, 
-            detail=f"Stream inativo (playlist não atualizada há {int(playlist_age)}s)"
+            detail=f"Stream inativo (playlist: {int(playlist_age)}s, último segmento: {int(newest_segment_age) if newest_segment_age else 'N/A'}s)"
         )
     
     async with aiofiles.open(playlist_path, mode='r') as f:
@@ -387,6 +414,19 @@ async def get_playlist(stream_key: str):
     
     if valid_segments == 0:
         raise HTTPException(status_code=404, detail="Nenhum segmento válido encontrado")
+    
+    # Se stream não está registrado mas temos arquivos, registrar automaticamente
+    if stream_key not in stream_manager.streams:
+        print(f"⚠️ Stream {stream_key} não registrado mas tem arquivos HLS - registrando automaticamente")
+        stream_manager.streams[stream_key] = {
+            "name": stream_key,
+            "source_url": "unknown",
+            "status": "running",
+            "mode": "recovered",
+            "dir": str(stream_dir),
+            "start_time": time.time(),
+            "restart_count": 0,
+        }
     
     adjusted_content = '\n'.join(adjusted_lines)
     

@@ -2,6 +2,7 @@
 """
 IVMS Cloud Agent - Agente local que conecta ao backend cloud
 Este agente roda na rede do cliente e se comunica com o cloud via HTTPS/WSS
+Inclui suporte a eventos ONVIF para Motion Detection, Analytics, etc.
 """
 
 import os
@@ -16,6 +17,7 @@ import logging
 import signal
 from datetime import datetime
 from typing import Optional, Dict, Any, Callable, List
+from urllib.parse import urlparse
 import argparse
 
 # Dependências
@@ -39,6 +41,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Tenta importar cliente ONVIF
+ONVIF_AVAILABLE = False
+try:
+    from onvif_events import OnvifEventsManager, OnvifEvent
+    ONVIF_AVAILABLE = True
+    logger.info("📡 ONVIF Events disponível")
+except ImportError:
+    logger.warning("⚠️ ONVIF Events não disponível (onvif_events.py não encontrado)")
+
 
 class StreamProcess:
     """Representa um processo de streaming ativo"""
@@ -59,6 +70,7 @@ class CloudAgent:
     - Envia heartbeats periódicos
     - Recebe comandos do cloud
     - Gerencia streams RTSP → RTMP
+    - Escuta eventos ONVIF e envia para o cloud
     """
     
     def __init__(
@@ -67,11 +79,13 @@ class CloudAgent:
         device_token: str,
         rtmp_url: str = "rtmp://localhost/live",
         heartbeat_interval: int = 10,  # Reduced from 30s for faster command processing
+        enable_onvif_events: bool = True,
     ):
         self.cloud_url = cloud_url.rstrip('/')
         self.device_token = device_token
         self.rtmp_url = rtmp_url
         self.heartbeat_interval = heartbeat_interval
+        self.enable_onvif_events = enable_onvif_events and ONVIF_AVAILABLE
         
         # Estado
         self.agent_id: Optional[str] = None
@@ -84,6 +98,10 @@ class CloudAgent:
         # Streams ativos
         self.streams: Dict[str, StreamProcess] = {}
         self.streams_lock = threading.Lock()
+        
+        # ONVIF Events Manager
+        self.onvif_manager: Optional[OnvifEventsManager] = None
+        self.onvif_cameras: Dict[str, Dict] = {}  # IP -> {username, password, name}
         
         # FFmpeg
         self.ffmpeg_path = self._find_ffmpeg()
@@ -101,10 +119,16 @@ class CloudAgent:
         self.monitor_thread: Optional[threading.Thread] = None
         self.realtime_channel = None
         
+        # Event buffer for batching
+        self._event_buffer: List[Dict] = []
+        self._event_buffer_lock = threading.Lock()
+        self._last_event_flush = time.time()
+        
         logger.info(f"🖥️  Hostname: {self.hostname}")
         logger.info(f"🌐 IP Local: {self.local_ip}")
         logger.info(f"💻 Sistema: {self.os_info}")
         logger.info(f"🎬 FFmpeg: {'✓ Disponível' if self.ffmpeg_available else '✗ Não encontrado'}")
+        logger.info(f"📡 ONVIF Events: {'✓ Habilitado' if self.enable_onvif_events else '✗ Desabilitado'}")
     
     def _find_ffmpeg(self) -> Optional[str]:
         """Encontra o executável do FFmpeg"""
@@ -296,6 +320,12 @@ class CloudAgent:
                 result = self._handle_get_status()
                 self.send_command_result(cmd_id, "completed", result)
                 
+            elif cmd_type == "test_onvif":
+                logger.info(f"🔧 Processando test_onvif com payload: {payload}")
+                result = self._handle_test_onvif(payload)
+                logger.info(f"📤 Resultado test_onvif: {result}")
+                self.send_command_result(cmd_id, "completed", result)
+                
             else:
                 self.send_command_result(
                     cmd_id, 
@@ -308,10 +338,14 @@ class CloudAgent:
             self.send_command_result(cmd_id, "failed", error_message=str(e))
     
     def _handle_start_stream(self, payload: Dict) -> Dict:
-        """Inicia um stream RTSP → RTMP"""
+        """Inicia um stream RTSP → RTMP e opcionalmente escuta eventos ONVIF"""
         stream_key = payload.get("stream_key")
         rtsp_url = payload.get("rtsp_url")
         camera_name = payload.get("camera_name", "")
+        enable_events = payload.get("enable_onvif_events", True)
+        onvif_username = payload.get("onvif_username", "admin")
+        onvif_password = payload.get("onvif_password", "")
+        onvif_port = payload.get("onvif_port", 80)
         
         if not stream_key or not rtsp_url:
             return {"success": False, "error": "stream_key e rtsp_url são obrigatórios"}
@@ -326,6 +360,16 @@ class CloudAgent:
             stream = StreamProcess(stream_key, rtsp_url, camera_name)
             stream.status = "starting"
             self.streams[stream_key] = stream
+        
+        # Extrai IP da câmera da URL RTSP
+        camera_ip = self._extract_ip_from_rtsp(rtsp_url)
+        
+        # Extrai credenciais da URL RTSP se não fornecidas
+        if not onvif_password:
+            parsed_creds = self._extract_credentials_from_rtsp(rtsp_url)
+            if parsed_creds:
+                onvif_username = parsed_creds.get("username", onvif_username)
+                onvif_password = parsed_creds.get("password", "")
         
         # Inicia FFmpeg em thread separada
         def start_ffmpeg():
@@ -357,6 +401,16 @@ class CloudAgent:
                 
                 logger.info(f"✅ Stream {stream_key} iniciado")
                 
+                # Inicia escuta de eventos ONVIF se habilitado
+                if enable_events and self.enable_onvif_events and camera_ip:
+                    self._start_onvif_events(
+                        camera_ip=camera_ip,
+                        camera_name=camera_name or stream_key,
+                        username=onvif_username,
+                        password=onvif_password,
+                        port=onvif_port,
+                    )
+                
             except Exception as e:
                 logger.error(f"❌ Erro ao iniciar stream: {e}")
                 with self.streams_lock:
@@ -366,10 +420,10 @@ class CloudAgent:
         
         threading.Thread(target=start_ffmpeg, daemon=True).start()
         
-        return {"success": True, "stream_key": stream_key}
+        return {"success": True, "stream_key": stream_key, "onvif_events": enable_events and self.enable_onvif_events}
     
     def _handle_stop_stream(self, payload: Dict) -> Dict:
-        """Para um stream ativo"""
+        """Para um stream ativo e a escuta de eventos ONVIF"""
         stream_key = payload.get("stream_key")
         
         if not stream_key:
@@ -380,6 +434,13 @@ class CloudAgent:
                 return {"success": False, "error": "Stream não encontrado"}
             
             stream = self.streams[stream_key]
+            
+            # Para escuta ONVIF se ativa
+            camera_ip = self._extract_ip_from_rtsp(stream.rtsp_url)
+            if camera_ip and self.onvif_manager:
+                self._stop_onvif_events(camera_ip)
+            
+            # Para o processo FFmpeg
             if stream.process:
                 stream.process.terminate()
                 try:
@@ -466,6 +527,134 @@ class CloudAgent:
             "streams": streams_info,
         }
     
+    def _handle_test_onvif(self, payload: Dict) -> Dict:
+        """Testa conectividade ONVIF e retorna capabilities da câmera"""
+        # Suporta tanto 'camera_ip' quanto 'ip' para compatibilidade
+        camera_ip = payload.get("camera_ip") or payload.get("ip")
+        camera_port = payload.get("camera_port") or payload.get("port", 80)
+        username = payload.get("username", "admin")
+        password = payload.get("password", "")
+        
+        if not camera_ip:
+            return {"success": False, "error": "camera_ip ou ip é obrigatório"}
+        
+        if not ONVIF_AVAILABLE:
+            return {
+                "success": False, 
+                "error": "Módulo ONVIF não disponível no agente",
+                "onvif_available": False,
+            }
+        
+        start_time = time.time()
+        
+        try:
+            # Cria cliente temporário para teste
+            from onvif_events import OnvifEventsClient
+            
+            test_client = OnvifEventsClient(
+                camera_ip=camera_ip,
+                camera_port=camera_port,
+                username=username,
+                password=password,
+                camera_name="test",
+            )
+            
+            # Testa capabilities
+            has_capabilities = test_client.check_capabilities()
+            capabilities = test_client.event_capabilities if has_capabilities else {}
+            
+            # Tenta criar subscription para verificar suporte completo
+            subscription_ok = False
+            subscription_error = None
+            
+            if has_capabilities:
+                try:
+                    subscription_ok = test_client.create_pull_point_subscription()
+                except Exception as sub_e:
+                    subscription_error = str(sub_e)
+            
+            response_time = int((time.time() - start_time) * 1000)
+            
+            # Tenta obter informações do dispositivo
+            device_info = self._get_onvif_device_info(camera_ip, camera_port, username, password)
+            
+            return {
+                "success": has_capabilities,
+                "camera_ip": camera_ip,
+                "camera_port": camera_port,
+                "response_time_ms": response_time,
+                "onvif_available": True,
+                "capabilities": capabilities,
+                "pull_point_support": capabilities.get("pull_point", False),
+                "basic_notification_support": capabilities.get("basic_notification_interface", False),
+                "subscription_test": subscription_ok,
+                "subscription_error": subscription_error,
+                "device_info": device_info,
+                "message": "Câmera suporta eventos ONVIF" if has_capabilities else "Câmera não suporta eventos ONVIF ou credenciais inválidas",
+            }
+            
+        except Exception as e:
+            response_time = int((time.time() - start_time) * 1000)
+            logger.error(f"❌ Erro ao testar ONVIF: {e}")
+            return {
+                "success": False,
+                "camera_ip": camera_ip,
+                "response_time_ms": response_time,
+                "error": str(e),
+                "onvif_available": True,
+                "message": f"Erro ao conectar: {str(e)}",
+            }
+    
+    def _get_onvif_device_info(self, camera_ip: str, camera_port: int, username: str, password: str) -> Dict:
+        """Obtém informações do dispositivo via ONVIF"""
+        try:
+            from onvif_events import OnvifAuth
+            import xml.etree.ElementTree as ET
+            
+            wsse_header = OnvifAuth.create_wsse_header(username, password)
+            
+            # GetDeviceInformation request
+            envelope = f'''<?xml version="1.0" encoding="UTF-8"?>
+            <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+                           xmlns:tds="http://www.onvif.org/ver10/device/wsdl">
+                <soap:Header>
+                    {wsse_header}
+                </soap:Header>
+                <soap:Body>
+                    <tds:GetDeviceInformation/>
+                </soap:Body>
+            </soap:Envelope>'''
+            
+            response = requests.post(
+                f"http://{camera_ip}:{camera_port}/onvif/device_service",
+                data=envelope,
+                headers={
+                    'Content-Type': 'application/soap+xml; charset=utf-8',
+                    'SOAPAction': 'http://www.onvif.org/ver10/device/wsdl/GetDeviceInformation',
+                },
+                timeout=5,
+            )
+            
+            if response.status_code == 200:
+                root = ET.fromstring(response.text)
+                
+                # Parse device info
+                ns = {'tds': 'http://www.onvif.org/ver10/device/wsdl'}
+                info = root.find('.//tds:GetDeviceInformationResponse', ns)
+                
+                if info is not None:
+                    return {
+                        "manufacturer": info.findtext('tds:Manufacturer', '', ns),
+                        "model": info.findtext('tds:Model', '', ns),
+                        "firmware_version": info.findtext('tds:FirmwareVersion', '', ns),
+                        "serial_number": info.findtext('tds:SerialNumber', '', ns),
+                        "hardware_id": info.findtext('tds:HardwareId', '', ns),
+                    }
+        except Exception as e:
+            logger.debug(f"Não foi possível obter info do dispositivo: {e}")
+        
+        return {}
+    
     def _heartbeat_loop(self):
         """Loop de heartbeat"""
         while self.running:
@@ -481,7 +670,7 @@ class CloudAgent:
             time.sleep(self.heartbeat_interval)
     
     def _monitor_streams(self):
-        """Monitora saúde dos streams"""
+        """Monitora saúde dos streams e faz flush de eventos"""
         while self.running:
             with self.streams_lock:
                 for stream_key, stream in list(self.streams.items()):
@@ -492,7 +681,167 @@ class CloudAgent:
                             stream.status = "error"
                             stream.error = f"FFmpeg terminou com código {retcode}"
             
+            # Flush eventos periodicamente
+            self._flush_events()
+            
             time.sleep(5)
+    
+    def _extract_ip_from_rtsp(self, rtsp_url: str) -> Optional[str]:
+        """Extrai IP de uma URL RTSP"""
+        try:
+            parsed = urlparse(rtsp_url)
+            host = parsed.hostname
+            if host:
+                return host
+        except:
+            pass
+        return None
+    
+    def _extract_credentials_from_rtsp(self, rtsp_url: str) -> Optional[Dict]:
+        """Extrai credenciais de uma URL RTSP"""
+        try:
+            parsed = urlparse(rtsp_url)
+            if parsed.username and parsed.password:
+                return {
+                    "username": parsed.username,
+                    "password": parsed.password,
+                }
+        except:
+            pass
+        return None
+    
+    def _start_onvif_events(
+        self,
+        camera_ip: str,
+        camera_name: str,
+        username: str = "admin",
+        password: str = "",
+        port: int = 80,
+    ):
+        """Inicia escuta de eventos ONVIF para uma câmera"""
+        if not self.enable_onvif_events:
+            return
+        
+        # Inicializa manager se necessário
+        if self.onvif_manager is None:
+            self.onvif_manager = OnvifEventsManager(
+                event_callback=self._on_onvif_event
+            )
+            logger.info("📡 ONVIF Events Manager inicializado")
+        
+        # Verifica se já está escutando essa câmera
+        if camera_ip in self.onvif_cameras:
+            logger.info(f"📡 Já escutando eventos de {camera_ip}")
+            return
+        
+        # Registra câmera
+        self.onvif_cameras[camera_ip] = {
+            "name": camera_name,
+            "username": username,
+            "password": password,
+            "port": port,
+        }
+        
+        # Inicia escuta em thread separada
+        def start_listener():
+            try:
+                success = self.onvif_manager.add_camera(
+                    camera_ip=camera_ip,
+                    username=username,
+                    password=password,
+                    camera_name=camera_name,
+                    camera_port=port,
+                )
+                if success:
+                    logger.info(f"📡 Escutando eventos ONVIF de {camera_name} ({camera_ip})")
+                else:
+                    logger.warning(f"⚠️ Não foi possível iniciar ONVIF para {camera_name}")
+            except Exception as e:
+                logger.error(f"❌ Erro ao iniciar ONVIF: {e}")
+        
+        threading.Thread(target=start_listener, daemon=True).start()
+    
+    def _stop_onvif_events(self, camera_ip: str):
+        """Para escuta de eventos ONVIF de uma câmera"""
+        if self.onvif_manager and camera_ip in self.onvif_cameras:
+            try:
+                self.onvif_manager.remove_camera(camera_ip)
+                del self.onvif_cameras[camera_ip]
+                logger.info(f"📡 Parou escuta ONVIF de {camera_ip}")
+            except Exception as e:
+                logger.error(f"❌ Erro ao parar ONVIF: {e}")
+    
+    def _on_onvif_event(self, event):
+        """Callback quando um evento ONVIF é recebido"""
+        logger.info(f"📥 Evento ONVIF: {event.event_type} de {event.camera_name}")
+        
+        # Adiciona ao buffer para envio em lote
+        event_data = {
+            "event_type": event.event_type,
+            "camera_ip": event.camera_ip,
+            "camera_name": event.camera_name,
+            "severity": self._map_event_severity(event.event_type),
+            "message": f"{event.event_type.replace('_', ' ').title()} detectado",
+            "metadata": {
+                "topic": event.topic,
+                "source": event.source,
+                "data": event.data,
+            },
+            "timestamp": event.timestamp.isoformat(),
+        }
+        
+        with self._event_buffer_lock:
+            self._event_buffer.append(event_data)
+        
+        # Flush imediato para eventos críticos
+        if event.event_type in ['tampering', 'video_loss', 'intrusion_detection']:
+            self._flush_events()
+    
+    def _map_event_severity(self, event_type: str) -> str:
+        """Mapeia tipo de evento para severidade"""
+        critical = ['tampering', 'video_loss']
+        warning = ['intrusion_detection', 'line_crossing', 'alarm_input']
+        
+        if event_type in critical:
+            return 'critical'
+        elif event_type in warning:
+            return 'warning'
+        return 'info'
+    
+    def _flush_events(self):
+        """Envia eventos em lote para o cloud"""
+        with self._event_buffer_lock:
+            if not self._event_buffer:
+                return
+            
+            # Limita a 50 eventos por vez
+            events_to_send = self._event_buffer[:50]
+            self._event_buffer = self._event_buffer[50:]
+        
+        try:
+            response = requests.post(
+                f"{self.cloud_url}/functions/v1/receive-camera-event",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-device-token": self.device_token,
+                },
+                json={"events": events_to_send},
+                timeout=15,
+            )
+            
+            if response.status_code == 200:
+                logger.debug(f"📤 Enviados {len(events_to_send)} eventos para o cloud")
+            else:
+                logger.warning(f"⚠️ Falha ao enviar eventos: {response.status_code}")
+                # Recoloca eventos no buffer
+                with self._event_buffer_lock:
+                    self._event_buffer = events_to_send + self._event_buffer
+                    
+        except Exception as e:
+            logger.error(f"❌ Erro ao enviar eventos: {e}")
+            # Recoloca eventos no buffer
+            with self._event_buffer_lock:
+                self._event_buffer = events_to_send + self._event_buffer
     
     def start(self):
         """Inicia o agente"""
@@ -522,10 +871,18 @@ class CloudAgent:
         logger.info("🛑 Parando agente...")
         self.running = False
         
+        # Para escuta ONVIF
+        if self.onvif_manager:
+            self.onvif_manager.stop_all()
+            logger.info("📡 ONVIF Events parado")
+        
         # Para todos os streams
         with self.streams_lock:
             for stream_key in list(self.streams.keys()):
                 self._handle_stop_stream({"stream_key": stream_key})
+        
+        # Flush final de eventos
+        self._flush_events()
         
         logger.info("👋 Agente encerrado")
     

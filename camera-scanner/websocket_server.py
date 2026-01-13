@@ -17,10 +17,12 @@ from http import HTTPStatus
 
 try:
     import websockets
-    from websockets.legacy.server import HTTPResponse
     WEBSOCKETS_AVAILABLE = True
+    # Check websockets version for API compatibility
+    WEBSOCKETS_VERSION = tuple(int(x) for x in websockets.__version__.split('.')[:2])
 except ImportError:
     WEBSOCKETS_AVAILABLE = False
+    WEBSOCKETS_VERSION = (0, 0)
     print("⚠ websockets não instalado. Execute: pip install websockets")
 
 from stream_bridge import StreamBridge
@@ -28,19 +30,16 @@ from stream_bridge import StreamBridge
 logger = logging.getLogger(__name__)
 
 
-def process_request(path, request_headers):
+def process_request_legacy(path, request_headers):
     """
-    Handler para requisições HTTP antes do upgrade para WebSocket.
+    Handler para websockets < 13.0
     Responde a preflight requests (OPTIONS) com headers de Private Network Access.
     """
-    # Log da requisição
-    logger.debug(f"Request: {path}, Headers: {dict(request_headers)}")
+    logger.debug(f"Request (legacy): {path}, Headers: {dict(request_headers)}")
     
-    # Verifica se é um preflight request para Private Network Access
     if request_headers.get("Access-Control-Request-Private-Network") == "true":
         logger.info("Recebido preflight request para Private Network Access")
         
-        # Retorna resposta com headers CORS e Private Network Access
         headers = [
             ("Access-Control-Allow-Origin", "*"),
             ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
@@ -50,8 +49,49 @@ def process_request(path, request_headers):
         ]
         return HTTPStatus.OK, headers, b""
     
-    # Para outras requisições, deixa o WebSocket handler processar
     return None
+
+
+def process_request_modern(connection, request):
+    """
+    Handler para websockets >= 13.0
+    Responde a preflight requests (OPTIONS) com headers de Private Network Access.
+    """
+    try:
+        # In websockets 13+, request is a Request object with path and headers attributes
+        path = request.path
+        request_headers = request.headers
+        
+        logger.debug(f"Request (modern): {path}")
+        
+        if request_headers.get("Access-Control-Request-Private-Network") == "true":
+            logger.info("Recebido preflight request para Private Network Access")
+            
+            # Return a Response object for modern websockets
+            from websockets.http11 import Response
+            from websockets.datastructures import Headers
+            
+            headers = Headers([
+                ("Access-Control-Allow-Origin", "*"),
+                ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+                ("Access-Control-Allow-Headers", "Content-Type, Authorization"),
+                ("Access-Control-Allow-Private-Network", "true"),
+                ("Access-Control-Max-Age", "86400"),
+            ])
+            return Response(200, "OK", headers, b"")
+    except Exception as e:
+        logger.error(f"Error in process_request_modern: {e}")
+    
+    return None
+
+
+# Select the appropriate handler based on version
+def get_process_request_handler():
+    """Returns the appropriate process_request handler for the installed websockets version."""
+    if WEBSOCKETS_VERSION >= (13, 0):
+        return process_request_modern
+    else:
+        return process_request_legacy
 
 
 class BridgeWebSocketServer:
@@ -393,16 +433,20 @@ class BridgeWebSocketServer:
         logger.info(f"Iniciando WebSocket server em ws://{self.host}:{self.port}")
         
         try:
+            # Get the appropriate handler for this version of websockets
+            process_request_handler = get_process_request_handler()
+            
             # Adiciona process_request para suportar Private Network Access
             async with websockets.serve(
                 self.handle_client, 
                 self.host, 
                 self.port,
-                process_request=process_request,
+                process_request=process_request_handler,
             ):
                 logger.info(f"✓ WebSocket server rodando em ws://{self.host}:{self.port}")
                 logger.info(f"  FFmpeg disponível: {self.bridge.is_ffmpeg_available()}")
                 logger.info(f"  Private Network Access habilitado")
+                logger.info(f"  websockets version: {websockets.__version__}")
                 
                 while self._running:
                     await asyncio.sleep(1)

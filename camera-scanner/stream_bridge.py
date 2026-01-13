@@ -181,15 +181,19 @@ class StreamBridge:
         # Monta URL RTMP de destino
         rtmp_url = f"{self.rtmp_server_url}/{stream_key}"
         
-        # Comando FFmpeg otimizado para baixa latência
+        # Comando FFmpeg otimizado para BAIXÍSSIMA latência
         cmd = [
             self._ffmpeg_path,
-            "-rtsp_transport", "tcp",           # TCP mais estável
-            "-timeout", "5000000",              # Timeout 5s em microsegundos
+            "-fflags", "+genpts+discardcorrupt",  # Gerar timestamps, descartar corrompidos
+            "-rtsp_transport", "tcp",
+            "-timeout", "5000000",
+            "-analyzeduration", "500000",         # Análise rápida (0.5s)
+            "-probesize", "500000",               # Probe pequeno
             "-i", rtsp_url,
-            "-c:v", "copy",                     # Copia vídeo sem re-encoding
-            "-c:a", "aac",                      # Re-encode áudio para AAC
-            "-b:a", "128k",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "64k",                        # Áudio menor
+            "-ar", "44100",
             "-f", "flv",
             "-flvflags", "no_duration_filesize",
             rtmp_url
@@ -207,9 +211,9 @@ class StreamBridge:
                 stdin=subprocess.DEVNULL
             )
             
-            # Aguarda um momento para verificar se iniciou corretamente
+            # Aguarda menos tempo - apenas para verificar se não crashou imediatamente
             import time
-            time.sleep(2)
+            time.sleep(0.5)
             
             if process.poll() is not None:
                 # Processo já terminou - provavelmente erro

@@ -107,12 +107,22 @@ async def debug_hls_dir():
     result = {
         "hls_base_dir": str(HLS_DIR),
         "hls_dir_exists": HLS_DIR.exists(),
-        "streams": {}
+        "streams": {},
+        "all_items": []  # Lista todos os itens no diretório raiz
     }
     
     if HLS_DIR.exists():
         now = time.time()
+        
+        # Listar TUDO no diretório raiz
         for item in HLS_DIR.iterdir():
+            item_info = {
+                "name": item.name,
+                "is_dir": item.is_dir(),
+                "size": item.stat().st_size if item.is_file() else None,
+            }
+            result["all_items"].append(item_info)
+            
             if item.is_dir():
                 files = []
                 for f in item.iterdir():
@@ -127,7 +137,7 @@ async def debug_hls_dir():
                     "files": sorted(files, key=lambda x: x["age_seconds"])
                 }
             else:
-                # Arquivo na raiz (não deveria existir com hls_nested on)
+                # Arquivo na raiz
                 result["root_files"] = result.get("root_files", [])
                 result["root_files"].append(item.name)
     
@@ -139,6 +149,7 @@ async def debug_stream(stream_key: str):
     """Debug endpoint para verificar status de um stream"""
     import os as os_module
     import time
+    import subprocess
     
     stream_info = stream_manager.get_stream_status(stream_key)
     stream_dir = HLS_DIR / stream_key
@@ -147,48 +158,84 @@ async def debug_stream(stream_key: str):
     playlist_content = None
     newest_segment_age = None
     process_running = False
+    nginx_hls_exists = False
     
-    # Verificar se processo está rodando
+    # Verificar se processo FFmpeg está rodando (para streams pull)
     if stream_key in stream_manager.processes:
         process = stream_manager.processes[stream_key]
         process_running = process.poll() is None
     
+    # Verificar diretório HLS criado pelo nginx-rtmp
     if stream_dir.exists():
+        nginx_hls_exists = True
         all_files = os_module.listdir(stream_dir)
         now = time.time()
         
         for f in all_files:
             file_path = stream_dir / f
-            stat = os_module.stat(file_path)
-            age = now - stat.st_mtime
-            files.append({
-                "name": f,
-                "size": stat.st_size,
-                "age_seconds": round(age, 1)
-            })
-            
-            # Track newest .ts segment
-            if f.endswith('.ts'):
-                if newest_segment_age is None or age < newest_segment_age:
-                    newest_segment_age = age
+            try:
+                stat = os_module.stat(file_path)
+                age = now - stat.st_mtime
+                files.append({
+                    "name": f,
+                    "size": stat.st_size,
+                    "age_seconds": round(age, 1)
+                })
+                
+                # Track newest .ts segment
+                if f.endswith('.ts'):
+                    if newest_segment_age is None or age < newest_segment_age:
+                        newest_segment_age = age
+            except:
+                pass
         
-        playlist_path = stream_dir / "index.m3u8"
-        if playlist_path.exists():
-            async with aiofiles.open(playlist_path, mode='r') as f:
-                playlist_content = await f.read()
+        # Tentar ler playlist
+        for playlist_name in ["index.m3u8", f"{stream_key}.m3u8"]:
+            playlist_path = stream_dir / playlist_name
+            if playlist_path.exists():
+                async with aiofiles.open(playlist_path, mode='r') as f:
+                    playlist_content = await f.read()
+                break
+    
+    # Verificar se nginx está rodando e escutando na porta 1935
+    nginx_status = "unknown"
+    try:
+        result = subprocess.run(["pgrep", "-x", "nginx"], capture_output=True, timeout=2)
+        nginx_status = "running" if result.returncode == 0 else "stopped"
+    except:
+        pass
+    
+    # Determinar diagnóstico
+    mode = stream_info.get("mode") if stream_info else None
+    
+    if mode == "rtmp-push":
+        if nginx_hls_exists and files:
+            if newest_segment_age and newest_segment_age < 10:
+                diagnosis = "OK - nginx-rtmp generating segments"
+            else:
+                diagnosis = f"STALLED - No new segments for {newest_segment_age:.0f}s" if newest_segment_age else "STALLED"
+        elif nginx_hls_exists:
+            diagnosis = "WAITING - Directory exists but no files yet"
+        else:
+            diagnosis = "ERROR - HLS directory not created by nginx-rtmp"
+    else:
+        diagnosis = "OK - FFmpeg generating segments" if (process_running and newest_segment_age and newest_segment_age < 10) \
+                     else "STALLED - No new segments" if (newest_segment_age and newest_segment_age > 10) \
+                     else "DEAD - Process not running" if not process_running \
+                     else "STARTING - Waiting for segments"
     
     return {
         "stream_key": stream_key,
         "stream_info": stream_info,
+        "mode": mode,
+        "nginx_status": nginx_status,
         "process_running": process_running,
-        "hls_dir_exists": stream_dir.exists(),
-        "files": sorted(files, key=lambda x: x["age_seconds"]),
+        "hls_dir_exists": nginx_hls_exists,
+        "files": sorted(files, key=lambda x: x["age_seconds"]) if files else [],
+        "file_count": len(files),
         "newest_segment_age_seconds": round(newest_segment_age, 1) if newest_segment_age else None,
         "playlist_content": playlist_content,
-        "diagnosis": "OK - FFmpeg generating segments" if (process_running and newest_segment_age and newest_segment_age < 10) 
-                     else "STALLED - No new segments" if (newest_segment_age and newest_segment_age > 10)
-                     else "DEAD - Process not running" if not process_running
-                     else "STARTING - Waiting for segments"
+        "diagnosis": diagnosis
     }
 
 
@@ -284,23 +331,62 @@ async def get_playlist(stream_key: str):
     """Retorna a playlist HLS (.m3u8) com paths corrigidos - ANTI-CACHE"""
     import time
     
-    playlist_path = HLS_DIR / stream_key / "index.m3u8"
+    stream_dir = HLS_DIR / stream_key
     
-    if not playlist_path.exists():
+    # Tentar encontrar playlist - pode ser index.m3u8 ou {stream_key}.m3u8
+    playlist_path = None
+    possible_names = ["index.m3u8", f"{stream_key}.m3u8", "playlist.m3u8"]
+    
+    for name in possible_names:
+        candidate = stream_dir / name
+        if candidate.exists():
+            playlist_path = candidate
+            break
+    
+    # Se não encontrou por nome, procurar qualquer .m3u8
+    if not playlist_path and stream_dir.exists():
+        m3u8_files = list(stream_dir.glob("*.m3u8"))
+        if m3u8_files:
+            playlist_path = m3u8_files[0]
+    
+    if not playlist_path or not playlist_path.exists():
         raise HTTPException(status_code=404, detail="Stream não encontrada ou ainda iniciando")
+    
+    # Verificar idade da playlist - se muito antiga, stream provavelmente parou
+    playlist_age = time.time() - playlist_path.stat().st_mtime
+    if playlist_age > 30:
+        # Playlist não foi atualizada em 30s - stream provavelmente morreu
+        raise HTTPException(
+            status_code=503, 
+            detail=f"Stream inativo (playlist não atualizada há {int(playlist_age)}s)"
+        )
     
     async with aiofiles.open(playlist_path, mode='r') as f:
         content = await f.read()
     
     # Ajustar paths dos segmentos para incluir o stream_key
+    # E verificar se os segmentos existem
     lines = content.split('\n')
     adjusted_lines = []
+    valid_segments = 0
+    
     for line in lines:
         if line.endswith('.ts'):
-            # Adicionar timestamp para evitar cache de segmentos
-            adjusted_lines.append(f"{stream_key}/{line}?_={int(time.time() * 1000)}")
+            segment_path = stream_dir / line
+            if segment_path.exists():
+                # Adicionar timestamp para evitar cache de segmentos
+                adjusted_lines.append(f"{stream_key}/{line}?_={int(time.time() * 1000)}")
+                valid_segments += 1
+            else:
+                # Segmento não existe mais - pular (não adicionar linha anterior também)
+                # Remover a linha EXTINF anterior se foi adicionada
+                if adjusted_lines and adjusted_lines[-1].startswith('#EXTINF'):
+                    adjusted_lines.pop()
         else:
             adjusted_lines.append(line)
+    
+    if valid_segments == 0:
+        raise HTTPException(status_code=404, detail="Nenhum segmento válido encontrado")
     
     adjusted_content = '\n'.join(adjusted_lines)
     
@@ -350,35 +436,61 @@ async def rtmp_on_publish(request: Request):
         form = await request.form()
         stream_key = form.get("name", "")
         app_name = form.get("app", "")
+        addr = form.get("addr", "unknown")
         
-        print(f"📡 RTMP on_publish received: app={app_name}, name={stream_key}")
+        print(f"📡 RTMP on_publish received: app={app_name}, name={stream_key}, addr={addr}")
         
         if not stream_key:
             print("⚠️ No stream key received")
-            # Retornar 200 mesmo assim para não bloquear
             return Response(status_code=200)
         
-        # Registrar stream no manager (nginx já gera HLS automaticamente)
-        base_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "localhost:8080")
+        # Se já existe um stream com esse key, limpar tudo primeiro
+        existing = stream_manager.streams.get(stream_key)
+        if existing:
+            old_mode = existing.get("mode", "unknown")
+            print(f"⚠️ Stream {stream_key} already exists (mode: {old_mode}), cleaning up...")
+            
+            # Se tinha um processo FFmpeg rodando, parar
+            if stream_key in stream_manager.processes:
+                process = stream_manager.processes[stream_key]
+                if process.poll() is None:
+                    print(f"   Stopping FFmpeg process PID {process.pid}")
+                    try:
+                        import signal
+                        import os as os_module
+                        if os_module.name != 'nt':
+                            os_module.killpg(os_module.getpgid(process.pid), signal.SIGKILL)
+                        else:
+                            process.kill()
+                    except:
+                        pass
+                del stream_manager.processes[stream_key]
+            
+            # Cancelar watchdog se existir
+            if stream_key in stream_manager.watchdog_tasks:
+                task = stream_manager.watchdog_tasks[stream_key]
+                if not task.done():
+                    task.cancel()
+                del stream_manager.watchdog_tasks[stream_key]
         
+        # Registrar/atualizar como stream RTMP push
+        print(f"✅ Registering RTMP push stream: {stream_key}")
         stream_manager.streams[stream_key] = {
             "name": stream_key,
             "source_url": f"rtmp://localhost/live/{stream_key}",
             "status": "running",
-            "mode": "rtmp-push",
+            "mode": "rtmp-push",  # IMPORTANTE: marcar como RTMP push
             "dir": str(HLS_DIR / stream_key),
             "start_time": __import__('time').time(),
             "restart_count": 0,
         }
         
-        print(f"✅ Stream registered: {stream_key}")
-        
-        # Retornar 200 OK para permitir o stream
         return Response(status_code=200)
         
     except Exception as e:
         print(f"❌ Error in on_publish: {e}")
-        # Retornar 200 mesmo em erro para não bloquear stream
+        import traceback
+        traceback.print_exc()
         return Response(status_code=200)
 
 

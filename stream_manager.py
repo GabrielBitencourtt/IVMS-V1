@@ -83,18 +83,18 @@ class StreamManager:
             "-strict", "experimental",
         ])
         
-        # Configurações de entrada ULTRA otimizadas para baixa latência
+        # Configurações de entrada otimizadas - mais tolerante para conexões remotas
         if is_rtsp:
             cmd.extend([
                 "-rtsp_transport", "tcp",
                 "-rtsp_flags", "prefer_tcp",
-                "-timeout", "3000000",           # 3 segundos timeout (era 5)
-                "-stimeout", "3000000",          # Socket timeout
-                "-buffer_size", "512000",        # Buffer menor
-                "-max_delay", "100000",          # 100ms max delay
-                "-reorder_queue_size", "0",      # Sem reordenação
-                "-analyzeduration", "300000",    # 0.3s análise
-                "-probesize", "300000",          # 300KB probe
+                "-timeout", "10000000",          # 10 segundos timeout (aumentado para RTSP remoto)
+                "-stimeout", "10000000",         # Socket timeout
+                "-buffer_size", "1024000",       # Buffer maior para conexões instáveis
+                "-max_delay", "500000",          # 500ms max delay
+                "-reorder_queue_size", "500",    # Permitir reordenação
+                "-analyzeduration", "2000000",   # 2s análise (mais tempo para detectar codec)
+                "-probesize", "1000000",         # 1MB probe
             ])
         else:
             cmd.extend([
@@ -261,8 +261,8 @@ class StreamManager:
                 preexec_fn=os.setsid if os.name != 'nt' else None
             )
             
-            # Aguardar até 8 segundos para criar segmento .ts
-            for i in range(16):
+            # Aguardar até 15 segundos para criar segmento .ts (aumentado para RTSP remoto)
+            for i in range(30):
                 await asyncio.sleep(0.5)
                 
                 if process.poll() is not None:
@@ -278,7 +278,7 @@ class StreamManager:
                     self._register_process(stream_key, process, "copy")
                     return True
             
-            print(f"⚠️ Copy mode timeout - no segments generated")
+            print(f"⚠️ Copy mode timeout - no segments generated after 15s")
             self._kill_process(process)
             return False
             
@@ -344,17 +344,18 @@ class StreamManager:
             pass
     
     async def _watchdog(self, stream_key: str):
-        """Watchdog agressivo - verifica a cada 3s, reinicia após 10s sem segmentos
+        """Watchdog para streams FFmpeg pull (RTSP→HLS).
         
         IMPORTANTE: Este watchdog é apenas para streams FFmpeg pull (RTSP→HLS).
         Streams RTMP push são gerenciados pelo nginx-rtmp e não precisam de restart.
+        Configurado para ser mais tolerante com conexões RTSP remotas.
         """
         
-        await asyncio.sleep(8)  # Aguardar inicialização (reduzido de 15s)
+        await asyncio.sleep(20)  # Aguardar mais tempo para RTSP remoto inicializar
         
-        max_restarts = 15
-        stall_threshold = 10  # Segundos sem novos segmentos (reduzido de 15s)
-        check_interval = 3    # Verificar a cada 3s (reduzido de 5s)
+        max_restarts = 10         # Reduzir max restarts para não ficar em loop eterno
+        stall_threshold = 20      # 20 segundos sem novos segmentos antes de considerar stall
+        check_interval = 5        # Verificar a cada 5s
         
         consecutive_stalls = 0
         
@@ -419,10 +420,10 @@ class StreamManager:
                 else:
                     consecutive_stalls = 0
             else:
-                # Sem segmentos ainda
+                # Sem segmentos ainda - dar mais tempo para RTSP remoto
                 stream_age = time.time() - self.streams[stream_key].get("start_time", time.time())
-                if stream_age > 15:  # Se não gerou nenhum segmento em 15s
-                    print(f"⚠️ Stream {stream_key} never produced segments")
+                if stream_age > 30:  # 30 segundos para inicialização (aumentado de 15s)
+                    print(f"⚠️ Stream {stream_key} never produced segments after {stream_age:.0f}s")
                     await self._handle_restart(stream_key)
     
     def _get_newest_segment_time(self, stream_dir: Path) -> Optional[float]:

@@ -83,22 +83,23 @@ class StreamManager:
             "-strict", "experimental",
         ])
         
-        # Configurações de entrada otimizadas
+        # Configurações de entrada ULTRA otimizadas para baixa latência
         if is_rtsp:
             cmd.extend([
                 "-rtsp_transport", "tcp",
                 "-rtsp_flags", "prefer_tcp",
-                "-timeout", "5000000",           # 5 segundos timeout
-                "-buffer_size", "1024000",
-                "-max_delay", "500000",
-                "-reorder_queue_size", "500",
-                "-analyzeduration", "1000000",
-                "-probesize", "1000000",
+                "-timeout", "3000000",           # 3 segundos timeout (era 5)
+                "-stimeout", "3000000",          # Socket timeout
+                "-buffer_size", "512000",        # Buffer menor
+                "-max_delay", "100000",          # 100ms max delay
+                "-reorder_queue_size", "0",      # Sem reordenação
+                "-analyzeduration", "300000",    # 0.3s análise
+                "-probesize", "300000",          # 300KB probe
             ])
         else:
             cmd.extend([
-                "-analyzeduration", "1000000",
-                "-probesize", "1000000",
+                "-analyzeduration", "300000",
+                "-probesize", "300000",
             ])
         
         cmd.extend(["-i", source_url])
@@ -130,12 +131,12 @@ class StreamManager:
                 "-threads", "2",
             ])
         
-        # HLS OTIMIZADO para streaming contínuo em tempo real
+        # HLS ULTRA OTIMIZADO - segmentos menores para início rápido
         cmd.extend([
             "-f", "hls",
-            "-hls_time", "1",                     # Segmentos de 1 segundo
-            "-hls_list_size", "3",                # Apenas 3 segmentos na playlist
-            "-hls_flags", "delete_segments+independent_segments",  # DELETAR segmentos antigos
+            "-hls_time", "0.5",                   # Segmentos de 0.5 segundo
+            "-hls_list_size", "4",                # 4 segmentos = 2s na playlist
+            "-hls_flags", "delete_segments+independent_segments+split_by_time",
             "-hls_segment_type", "mpegts",
             "-hls_start_number_source", "datetime",
             "-start_number", "1",

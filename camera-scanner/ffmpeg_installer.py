@@ -2,10 +2,12 @@
 """
 FFmpeg Auto-Installer
 Detecta e instala FFmpeg automaticamente no sistema
+Funciona tanto em ambiente Python quanto em executáveis PyInstaller
 """
 
 import os
 import sys
+import ssl
 import shutil
 import subprocess
 import platform
@@ -13,24 +15,59 @@ import tempfile
 import zipfile
 import tarfile
 import logging
+from typing import Optional, Callable, Tuple
 from pathlib import Path
-from typing import Optional, Tuple, Callable
 import urllib.request
 
 logger = logging.getLogger(__name__)
 
-# URLs de download do FFmpeg
+
+def get_ssl_context():
+    """
+    Retorna contexto SSL que funciona em executáveis PyInstaller.
+    Usa múltiplos fallbacks para garantir funcionamento.
+    """
+    # Tenta contexto padrão primeiro
+    try:
+        ctx = ssl.create_default_context()
+        return ctx
+    except Exception:
+        pass
+    
+    # Fallback: contexto sem verificação (funciona sempre)
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        logger.warning("SSL: Usando modo sem verificação de certificado")
+        return ctx
+    except Exception:
+        pass
+    
+    return None
+
+
+# URLs de download do FFmpeg (com fallbacks)
 FFMPEG_DOWNLOADS = {
     "Windows": {
-        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+        "urls": [
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+            "https://github.com/GyanD/codexffmpeg/releases/download/7.1/ffmpeg-7.1-essentials_build.zip",
+        ],
         "executable": "ffmpeg.exe"
     },
     "Linux": {
-        "url": "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
+        "urls": [
+            "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz",
+        ],
         "executable": "ffmpeg"
     },
-    "Darwin": {  # macOS
-        "url": "https://evermeet.cx/ffmpeg/getrelease/zip",
+    "Darwin": {
+        "urls": [
+            "https://evermeet.cx/ffmpeg/getrelease/zip",
+            "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.0/darwin-x64.gz",
+        ],
         "executable": "ffmpeg"
     }
 }
@@ -47,11 +84,9 @@ class FFmpegInstaller:
     def _get_install_dir(self) -> Path:
         """Retorna o diretório de instalação do FFmpeg"""
         if self.system == "Windows":
-            # Instala em AppData/Local/CameraScanner/ffmpeg
             base = Path(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")))
             return base / "CameraScanner" / "ffmpeg"
         else:
-            # Linux/macOS: ~/.local/share/camera-scanner/ffmpeg
             return Path.home() / ".local" / "share" / "camera-scanner" / "ffmpeg"
     
     def _report_progress(self, message: str, percent: int = -1):
@@ -94,7 +129,7 @@ class FFmpegInstaller:
                     logger.info(f"FFmpeg encontrado em: {path}")
                     return path
         
-        # 4. Caminhos comuns no macOS (Homebrew)
+        # 4. Caminhos comuns no macOS
         if self.system == "Darwin":
             brew_paths = [
                 "/usr/local/bin/ffmpeg",
@@ -129,7 +164,6 @@ class FFmpegInstaller:
                 timeout=10
             )
             if result.returncode == 0:
-                # Extrai versão da primeira linha
                 first_line = result.stdout.split('\n')[0]
                 return first_line
             return None
@@ -150,23 +184,70 @@ class FFmpegInstaller:
         return True, ffmpeg_path, version
     
     def _download_with_progress(self, url: str, dest_path: str) -> bool:
-        """Baixa arquivo com progresso"""
+        """Baixa arquivo com progresso usando múltiplos métodos"""
+        
+        # Método 1: Tenta com PowerShell no Windows (mais confiável)
+        if self.system == "Windows":
+            try:
+                self._report_progress("Baixando via PowerShell...", 0)
+                
+                ps_script = f'''
+                $ProgressPreference = 'SilentlyContinue'
+                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                Invoke-WebRequest -Uri "{url}" -OutFile "{dest_path}" -UseBasicParsing
+                '''
+                
+                result = subprocess.run(
+                    ["powershell", "-Command", ps_script],
+                    capture_output=True,
+                    text=True,
+                    timeout=600
+                )
+                
+                if result.returncode == 0 and os.path.exists(dest_path):
+                    size_mb = os.path.getsize(dest_path) / (1024 * 1024)
+                    self._report_progress(f"Download concluído: {size_mb:.1f} MB", 100)
+                    return True
+                    
+            except Exception as e:
+                logger.warning(f"PowerShell falhou: {e}")
+        
+        # Método 2: Tenta com curl (disponível em Windows 10+, Linux, macOS)
         try:
-            self._report_progress(f"Conectando a {url[:50]}...", 0)
+            self._report_progress("Baixando via curl...", 0)
             
-            # Cria request com headers
+            result = subprocess.run(
+                ["curl", "-L", "-o", dest_path, "--progress-bar", url],
+                capture_output=True,
+                timeout=600
+            )
+            
+            if result.returncode == 0 and os.path.exists(dest_path):
+                size_mb = os.path.getsize(dest_path) / (1024 * 1024)
+                self._report_progress(f"Download concluído: {size_mb:.1f} MB", 100)
+                return True
+                
+        except Exception as e:
+            logger.warning(f"curl falhou: {e}")
+        
+        # Método 3: Tenta com urllib (fallback)
+        try:
+            self._report_progress("Baixando via Python...", 0)
+            
             req = urllib.request.Request(url, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             })
             
-            with urllib.request.urlopen(req, timeout=60) as response:
+            # Tenta com SSL padrão primeiro
+            ssl_context = get_ssl_context()
+            
+            with urllib.request.urlopen(req, timeout=300, context=ssl_context) as response:
                 total_size = int(response.headers.get('content-length', 0))
                 downloaded = 0
-                chunk_size = 1024 * 1024  # 1MB chunks
                 
                 with open(dest_path, 'wb') as f:
                     while True:
-                        chunk = response.read(chunk_size)
+                        chunk = response.read(1024 * 1024)
                         if not chunk:
                             break
                         f.write(chunk)
@@ -175,30 +256,26 @@ class FFmpegInstaller:
                         if total_size > 0:
                             percent = int((downloaded / total_size) * 100)
                             size_mb = downloaded / (1024 * 1024)
-                            total_mb = total_size / (1024 * 1024)
-                            self._report_progress(
-                                f"Baixando FFmpeg: {size_mb:.1f}/{total_mb:.1f} MB",
-                                percent
-                            )
+                            self._report_progress(f"Baixando: {size_mb:.1f} MB", percent)
             
-            self._report_progress("Download concluído", 100)
-            return True
-            
+            if os.path.exists(dest_path):
+                self._report_progress("Download concluído", 100)
+                return True
+                
         except Exception as e:
-            logger.error(f"Erro no download: {e}")
+            logger.error(f"urllib falhou: {e}")
             self._report_progress(f"Erro no download: {e}", -1)
-            return False
+        
+        return False
     
     def _extract_windows(self, zip_path: str) -> Optional[str]:
         """Extrai FFmpeg do arquivo ZIP (Windows)"""
         try:
             self._report_progress("Extraindo arquivos...", 0)
             
-            # Cria diretório de instalação
             self.install_dir.mkdir(parents=True, exist_ok=True)
             
             with zipfile.ZipFile(zip_path, 'r') as zf:
-                # Encontra o diretório raiz do ZIP
                 root_dirs = [n for n in zf.namelist() if n.count('/') == 1 and n.endswith('/')]
                 root_dir = root_dirs[0] if root_dirs else ""
                 
@@ -206,9 +283,7 @@ class FFmpegInstaller:
                 total = len(members)
                 
                 for i, member in enumerate(members):
-                    # Extrai apenas bin/ffmpeg.exe e bin/ffprobe.exe
                     if 'bin/ffmpeg' in member or 'bin/ffprobe' in member:
-                        # Remove o diretório raiz do caminho
                         target_path = member.replace(root_dir, "")
                         target_full = self.install_dir / target_path
                         
@@ -218,10 +293,7 @@ class FFmpegInstaller:
                             dst.write(src.read())
                     
                     if i % 10 == 0:
-                        self._report_progress(
-                            f"Extraindo... {i}/{total}",
-                            int((i / total) * 100)
-                        )
+                        self._report_progress(f"Extraindo... {i}/{total}", int((i / total) * 100))
             
             ffmpeg_path = self.install_dir / "bin" / "ffmpeg.exe"
             if ffmpeg_path.exists():
@@ -232,7 +304,6 @@ class FFmpegInstaller:
             
         except Exception as e:
             logger.error(f"Erro na extração: {e}")
-            self._report_progress(f"Erro na extração: {e}", -1)
             return None
     
     def _extract_linux(self, tar_path: str) -> Optional[str]:
@@ -243,17 +314,13 @@ class FFmpegInstaller:
             self.install_dir.mkdir(parents=True, exist_ok=True)
             
             with tarfile.open(tar_path, 'r:xz') as tf:
-                members = tf.getmembers()
-                
-                for member in members:
+                for member in tf.getmembers():
                     if member.name.endswith('/ffmpeg') or member.name.endswith('/ffprobe'):
-                        # Extrai apenas o executável
                         member.name = os.path.basename(member.name)
                         tf.extract(member, self.install_dir)
             
             ffmpeg_path = self.install_dir / "ffmpeg"
             if ffmpeg_path.exists():
-                # Torna executável
                 os.chmod(ffmpeg_path, 0o755)
                 self._report_progress("Extração concluída", 100)
                 return str(ffmpeg_path)
@@ -262,7 +329,6 @@ class FFmpegInstaller:
             
         except Exception as e:
             logger.error(f"Erro na extração: {e}")
-            self._report_progress(f"Erro na extração: {e}", -1)
             return None
     
     def _extract_macos(self, zip_path: str) -> Optional[str]:
@@ -287,59 +353,90 @@ class FFmpegInstaller:
             logger.error(f"Erro na extração: {e}")
             return None
     
+    def _extract_gzip(self, gz_path: str) -> Optional[str]:
+        """Extrai FFmpeg de arquivo .gz simples"""
+        try:
+            import gzip
+            
+            self._report_progress("Extraindo arquivo gzip...", 0)
+            self.install_dir.mkdir(parents=True, exist_ok=True)
+            
+            ffmpeg_path = self.install_dir / "ffmpeg"
+            
+            with gzip.open(gz_path, 'rb') as f_in:
+                with open(ffmpeg_path, 'wb') as f_out:
+                    f_out.write(f_in.read())
+            
+            os.chmod(ffmpeg_path, 0o755)
+            self._report_progress("Extração concluída", 100)
+            return str(ffmpeg_path)
+            
+        except Exception as e:
+            logger.error(f"Erro na extração gzip: {e}")
+            return None
+    
     def install_ffmpeg(self) -> Tuple[bool, Optional[str]]:
         """
         Instala o FFmpeg automaticamente.
-        Retorna: (sucesso, caminho_ffmpeg)
+        Tenta múltiplos URLs de download como fallback.
         """
         if self.system not in FFMPEG_DOWNLOADS:
             self._report_progress(f"Sistema não suportado: {self.system}")
             return False, None
         
         config = FFMPEG_DOWNLOADS[self.system]
-        url = config["url"]
+        urls = config["urls"]
         
-        # Cria diretório temporário para download
-        with tempfile.TemporaryDirectory() as temp_dir:
-            if self.system == "Linux":
-                download_file = os.path.join(temp_dir, "ffmpeg.tar.xz")
-            else:
-                download_file = os.path.join(temp_dir, "ffmpeg.zip")
+        for url_index, url in enumerate(urls):
+            self._report_progress(f"Tentando fonte {url_index + 1} de {len(urls)}...")
             
-            # Download
-            self._report_progress("Iniciando download do FFmpeg...")
-            if not self._download_with_progress(url, download_file):
-                return False, None
-            
-            # Extração
-            if self.system == "Windows":
-                ffmpeg_path = self._extract_windows(download_file)
-            elif self.system == "Linux":
-                ffmpeg_path = self._extract_linux(download_file)
-            else:  # macOS
-                ffmpeg_path = self._extract_macos(download_file)
-            
-            if ffmpeg_path:
-                self._report_progress(f"✓ FFmpeg instalado em: {ffmpeg_path}")
-                return True, ffmpeg_path
-            else:
-                self._report_progress("❌ Falha na instalação do FFmpeg")
-                return False, None
+            with tempfile.TemporaryDirectory() as temp_dir:
+                if url.endswith('.tar.xz') or 'linux' in url.lower():
+                    download_file = os.path.join(temp_dir, "ffmpeg.tar.xz")
+                elif url.endswith('.gz'):
+                    download_file = os.path.join(temp_dir, "ffmpeg.gz")
+                else:
+                    download_file = os.path.join(temp_dir, "ffmpeg.zip")
+                
+                self._report_progress(f"Baixando de: {url[:50]}...")
+                if not self._download_with_progress(url, download_file):
+                    self._report_progress(f"Falha no download, tentando próxima fonte...")
+                    continue
+                
+                ffmpeg_path = None
+                try:
+                    if download_file.endswith('.tar.xz'):
+                        ffmpeg_path = self._extract_linux(download_file)
+                    elif download_file.endswith('.gz') and not download_file.endswith('.tar.gz'):
+                        ffmpeg_path = self._extract_gzip(download_file)
+                    elif self.system == "Windows":
+                        ffmpeg_path = self._extract_windows(download_file)
+                    else:
+                        ffmpeg_path = self._extract_macos(download_file)
+                except Exception as e:
+                    self._report_progress(f"Erro na extração: {e}")
+                    continue
+                
+                if ffmpeg_path:
+                    self._report_progress(f"✓ FFmpeg instalado em: {ffmpeg_path}")
+                    return True, ffmpeg_path
+                else:
+                    self._report_progress(f"Falha na extração, tentando próxima fonte...")
+        
+        self._report_progress("❌ Todas as fontes de download falharam")
+        return False, None
     
     def ensure_ffmpeg(self) -> Tuple[bool, Optional[str]]:
         """
         Garante que o FFmpeg está disponível.
         Se não estiver, tenta instalar automaticamente.
-        Retorna: (disponível, caminho)
         """
-        # Primeiro verifica se já existe
         available, path, version = self.is_ffmpeg_available()
         
         if available:
             self._report_progress(f"✓ FFmpeg já instalado: {version}")
             return True, path
         
-        # Tenta instalar
         self._report_progress("FFmpeg não encontrado. Instalando...")
         success, path = self.install_ffmpeg()
         
@@ -349,20 +446,13 @@ class FFmpegInstaller:
 def check_and_install_ffmpeg(progress_callback: Optional[Callable] = None) -> Tuple[bool, Optional[str]]:
     """
     Função de conveniência para verificar e instalar FFmpeg.
-    
-    Args:
-        progress_callback: Função callback(message, percent) para progresso
-    
-    Returns:
-        (sucesso, caminho_ffmpeg)
     """
     installer = FFmpegInstaller(progress_callback)
     return installer.ensure_ffmpeg()
 
 
-# Teste standalone
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
     
     def progress(msg, pct):
         if pct >= 0:
@@ -376,21 +466,26 @@ if __name__ == "__main__":
     
     installer = FFmpegInstaller(progress)
     
-    # Verifica se já tem
-    available, path, version = installer.is_ffmpeg_available()
+    print("\n🔍 Verificando FFmpeg...")
+    success, path = installer.ensure_ffmpeg()
     
-    if available:
-        print(f"\n✓ FFmpeg disponível: {path}")
-        print(f"  Versão: {version}")
-    else:
-        print("\n⚠ FFmpeg não encontrado")
-        response = input("\nDeseja instalar automaticamente? (s/n): ")
+    if success:
+        print(f"\n✅ FFmpeg pronto para uso!")
+        print(f"   Caminho: {path}")
         
-        if response.lower() == 's':
-            success, path = installer.install_ffmpeg()
-            
-            if success:
-                print(f"\n✓ FFmpeg instalado com sucesso!")
-                print(f"  Caminho: {path}")
-            else:
-                print("\n❌ Falha na instalação")
+        version = installer.get_ffmpeg_version(path)
+        if version:
+            print(f"   Versão: {version}")
+    else:
+        print("\n❌ Não foi possível instalar o FFmpeg automaticamente.")
+        print("\n📋 Instalação manual:")
+        
+        system = platform.system()
+        if system == "Windows":
+            print("   1. Baixe de: https://www.gyan.dev/ffmpeg/builds/")
+            print("   2. Extraia para C:\\ffmpeg")
+            print("   3. Adicione C:\\ffmpeg\\bin ao PATH do sistema")
+        elif system == "Darwin":
+            print("   Execute: brew install ffmpeg")
+        else:
+            print("   Execute: sudo apt install ffmpeg")

@@ -2,6 +2,7 @@
 """
 WebSocket Server para comunicação com a plataforma web
 Integra o Scanner de Câmeras com o Bridge de Streaming
+Suporta Private Network Access (Chrome 94+)
 """
 
 import asyncio
@@ -12,9 +13,11 @@ import platform
 import uuid
 from typing import Set, Optional
 from datetime import datetime
+from http import HTTPStatus
 
 try:
     import websockets
+    from websockets.legacy.server import HTTPResponse
     WEBSOCKETS_AVAILABLE = True
 except ImportError:
     WEBSOCKETS_AVAILABLE = False
@@ -23,6 +26,32 @@ except ImportError:
 from stream_bridge import StreamBridge
 
 logger = logging.getLogger(__name__)
+
+
+def process_request(path, request_headers):
+    """
+    Handler para requisições HTTP antes do upgrade para WebSocket.
+    Responde a preflight requests (OPTIONS) com headers de Private Network Access.
+    """
+    # Log da requisição
+    logger.debug(f"Request: {path}, Headers: {dict(request_headers)}")
+    
+    # Verifica se é um preflight request para Private Network Access
+    if request_headers.get("Access-Control-Request-Private-Network") == "true":
+        logger.info("Recebido preflight request para Private Network Access")
+        
+        # Retorna resposta com headers CORS e Private Network Access
+        headers = [
+            ("Access-Control-Allow-Origin", "*"),
+            ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+            ("Access-Control-Allow-Headers", "Content-Type, Authorization"),
+            ("Access-Control-Allow-Private-Network", "true"),
+            ("Access-Control-Max-Age", "86400"),
+        ]
+        return HTTPStatus.OK, headers, b""
+    
+    # Para outras requisições, deixa o WebSocket handler processar
+    return None
 
 
 class BridgeWebSocketServer:
@@ -34,7 +63,7 @@ class BridgeWebSocketServer:
     """
     
     def __init__(self, 
-                 host: str = "127.0.0.1", 
+                 host: str = "0.0.0.0",  # Aceita conexões de localhost e 127.0.0.1
                  port: int = 8765,
                  rtmp_server_url: str = "rtmp://hopper.proxy.rlwy.net:46960/live"):
         self.host = host
@@ -70,6 +99,39 @@ class BridgeWebSocketServer:
                 "error": error
             }
         }))
+    
+    def _test_rtsp_connection(self, rtsp_url: str) -> dict:
+        """Testa conexão RTSP localmente com suporte a Digest Auth"""
+        # Usa o módulo separado para evitar importação circular
+        from rtsp_tester import test_rtsp_connection
+        
+        try:
+            success, message, details = test_rtsp_connection(rtsp_url, timeout=10)
+            
+            if success:
+                return {
+                    "success": True,
+                    "message": message,
+                    "rtsp_url": rtsp_url,
+                    "response_time_ms": details.get("response_time_ms", 0),
+                    "requires_auth": details.get("requires_auth", False),
+                    "codec": details.get("codec"),
+                    "auth_type": details.get("auth_type")
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": message,
+                    "rtsp_url": rtsp_url
+                }
+                
+        except Exception as e:
+            logger.error(f"Erro ao testar RTSP: {e}")
+            return {
+                "success": False,
+                "error": f"Erro interno: {str(e)}",
+                "rtsp_url": rtsp_url
+            }
     
     def on_ffmpeg_progress(self, message: str, percent: int):
         """Callback para progresso da instalação do FFmpeg"""
@@ -246,6 +308,33 @@ class BridgeWebSocketServer:
                     "data": {"streams": streams}
                 }))
             
+            elif msg_type == "test_rtsp":
+                # Testa conexão RTSP localmente
+                rtsp_url = msg_data.get("rtsp_url", "")
+                
+                if not rtsp_url:
+                    await websocket.send(json.dumps({
+                        "type": "rtsp_test_result",
+                        "data": {
+                            "success": False,
+                            "error": "URL RTSP não fornecida",
+                            "rtsp_url": rtsp_url
+                        }
+                    }))
+                    return
+                
+                # Testa conexão em thread separada
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: self._test_rtsp_connection(rtsp_url)
+                )
+                
+                await websocket.send(json.dumps({
+                    "type": "rtsp_test_result",
+                    "data": result
+                }))
+            
             elif msg_type == "start_scan":
                 # Dispara evento para o scanner (será tratado pelo app principal)
                 await self.broadcast({
@@ -303,12 +392,22 @@ class BridgeWebSocketServer:
         
         logger.info(f"Iniciando WebSocket server em ws://{self.host}:{self.port}")
         
-        async with websockets.serve(self.handle_client, self.host, self.port):
-            logger.info(f"✓ WebSocket server rodando em ws://{self.host}:{self.port}")
-            logger.info(f"  FFmpeg disponível: {self.bridge.is_ffmpeg_available()}")
-            
-            while self._running:
-                await asyncio.sleep(1)
+        try:
+            # Adiciona process_request para suportar Private Network Access
+            async with websockets.serve(
+                self.handle_client, 
+                self.host, 
+                self.port,
+                process_request=process_request,
+            ):
+                logger.info(f"✓ WebSocket server rodando em ws://{self.host}:{self.port}")
+                logger.info(f"  FFmpeg disponível: {self.bridge.is_ffmpeg_available()}")
+                logger.info(f"  Private Network Access habilitado")
+                
+                while self._running:
+                    await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"Erro no servidor WebSocket: {e}")
     
     def stop(self):
         """Para o servidor"""
@@ -318,7 +417,7 @@ class BridgeWebSocketServer:
             self.bridge.shutdown()
 
 
-def run_server(host: str = "127.0.0.1", port: int = 8765):
+def run_server(host: str = "0.0.0.0", port: int = 8765):
     """Função para rodar o servidor standalone"""
     server = BridgeWebSocketServer(host, port)
     

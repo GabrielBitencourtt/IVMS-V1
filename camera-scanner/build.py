@@ -10,6 +10,7 @@ import platform
 import subprocess
 import shutil
 
+
 def install_requirements():
     """Instala dependências necessárias para o build"""
     print("📦 Verificando dependências do build...")
@@ -38,6 +39,7 @@ def install_requirements():
         print("  ⬇ Instalando PyInstaller...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller", "-q"])
         print("  ✓ PyInstaller instalado")
+
 
 def build_executable():
     """Gera o executável standalone"""
@@ -149,7 +151,7 @@ def clean():
     """Remove arquivos de build"""
     base_dir = os.path.dirname(os.path.abspath(__file__))
     
-    for folder in ["build", "dist", "__pycache__"]:
+    for folder in ["build", "dist", "__pycache__", "bundled_ffmpeg"]:
         path = os.path.join(base_dir, folder)
         if os.path.exists(path):
             shutil.rmtree(path)

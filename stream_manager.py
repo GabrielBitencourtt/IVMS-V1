@@ -343,7 +343,11 @@ class StreamManager:
             pass
     
     async def _watchdog(self, stream_key: str):
-        """Watchdog agressivo - verifica a cada 3s, reinicia após 10s sem segmentos"""
+        """Watchdog agressivo - verifica a cada 3s, reinicia após 10s sem segmentos
+        
+        IMPORTANTE: Este watchdog é apenas para streams FFmpeg pull (RTSP→HLS).
+        Streams RTMP push são gerenciados pelo nginx-rtmp e não precisam de restart.
+        """
         
         await asyncio.sleep(8)  # Aguardar inicialização (reduzido de 15s)
         
@@ -355,6 +359,26 @@ class StreamManager:
         
         while stream_key in self.streams:
             await asyncio.sleep(check_interval)
+            
+            # IMPORTANTE: Não reiniciar streams RTMP push - são gerenciados externamente
+            stream_info = self.streams.get(stream_key, {})
+            if stream_info.get("mode") == "rtmp-push":
+                # Para RTMP push, apenas verificar se HLS está sendo gerado
+                stream_dir = Path(stream_info.get("dir", ""))
+                if stream_dir.exists():
+                    newest = self._get_newest_segment_time(stream_dir)
+                    if newest:
+                        age = time.time() - newest
+                        if age < 10:
+                            # HLS sendo gerado normalmente
+                            if stream_info.get("status") != "running":
+                                self.streams[stream_key]["status"] = "running"
+                        elif age > 30:
+                            # Sem segmentos por muito tempo - marcar como stopped
+                            if stream_info.get("status") == "running":
+                                print(f"⚠️ RTMP push stream {stream_key} stopped (no segments for {age:.0f}s)")
+                                self.streams[stream_key]["status"] = "stopped"
+                continue
             
             if stream_key not in self.processes:
                 break

@@ -130,16 +130,16 @@ class StreamManager:
                 "-threads", "2",
             ])
         
-        # HLS OTIMIZADO para streaming contínuo em tempo real
+        # HLS OTIMIZADO - segmentos com nome baseado em timestamp para evitar conflitos
         cmd.extend([
             "-f", "hls",
             "-hls_time", "1",                     # Segmentos de 1 segundo
-            "-hls_list_size", "3",                # Apenas 3 segmentos na playlist
-            "-hls_flags", "delete_segments+independent_segments",  # DELETAR segmentos antigos
+            "-hls_list_size", "4",                # 4 segmentos na playlist (um pouco mais para estabilidade)
+            "-hls_flags", "delete_segments+independent_segments+temp_file",  # temp_file evita arquivos parciais
             "-hls_segment_type", "mpegts",
             "-hls_start_number_source", "datetime",
             "-start_number", "1",
-            "-hls_segment_filename", str(stream_dir / "seg_%03d.ts"),
+            "-hls_segment_filename", str(stream_dir / "seg_%Y%m%d%H%M%S.ts"),  # Nome com timestamp completo
             str(output_path)
         ])
         
@@ -173,11 +173,27 @@ class StreamManager:
     ):
         """Lógica interna de iniciar stream (chamada por restart também)"""
         
-        # Criar/limpar diretório
+        # Criar diretório (NÃO remover se já existe - pode haver processo usando)
         stream_dir = self.hls_dir / stream_key
+        
+        # Limpar apenas arquivos antigos .ts e .m3u8, não o diretório inteiro
         if stream_dir.exists():
-            shutil.rmtree(stream_dir, ignore_errors=True)
+            try:
+                for f in stream_dir.iterdir():
+                    if f.suffix in ['.ts', '.m3u8', '.tmp']:
+                        try:
+                            f.unlink()
+                        except:
+                            pass
+            except Exception as e:
+                print(f"⚠️ Error cleaning stream dir: {e}")
+        
         stream_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Verificar se diretório foi criado
+        if not stream_dir.exists():
+            print(f"❌ Failed to create stream dir: {stream_dir}")
+            return
         
         # Preservar restart_count se existir
         restart_count = 0
@@ -294,10 +310,15 @@ class StreamManager:
     ):
         """Inicia com re-encoding"""
         
-        # Limpar diretório
-        if stream_dir.exists():
-            shutil.rmtree(stream_dir, ignore_errors=True)
+        # Garantir que o diretório existe (NÃO remover - pode causar erros de race condition)
         stream_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Verificar se diretório foi criado
+        if not stream_dir.exists():
+            print(f"❌ Failed to create stream dir: {stream_dir}")
+            self.streams[stream_key]["status"] = "error"
+            self.streams[stream_key]["error"] = "Failed to create HLS directory"
+            return
         
         cmd = self._build_ffmpeg_command(source_url, output_path, stream_dir, use_copy=False)
         print(f"🔄 Starting with re-encode...")

@@ -181,19 +181,21 @@ class StreamBridge:
         # Monta URL RTMP de destino
         rtmp_url = f"{self.rtmp_server_url}/{stream_key}"
         
-        # Comando FFmpeg otimizado para BAIXÍSSIMA latência
+        # Comando FFmpeg otimizado para LL-HLS (Low-Latency HLS)
         cmd = [
             self._ffmpeg_path,
-            "-fflags", "+genpts+discardcorrupt",  # Gerar timestamps, descartar corrompidos
+            "-fflags", "+genpts+discardcorrupt+nobuffer+flush_packets",
+            "-flags", "low_delay",
+            "-avioflags", "direct",
             "-rtsp_transport", "tcp",
             "-timeout", "5000000",
+            "-max_delay", "0",
+            "-reorder_queue_size", "0",
             "-analyzeduration", "500000",         # Análise rápida (0.5s)
             "-probesize", "500000",               # Probe pequeno
             "-i", rtsp_url,
             "-c:v", "copy",
-            "-c:a", "aac",
-            "-b:a", "64k",                        # Áudio menor
-            "-ar", "44100",
+            "-an",                                # Sem áudio para menor latência
             "-f", "flv",
             "-flvflags", "no_duration_filesize",
             rtmp_url

@@ -84,8 +84,8 @@ class HLSRelayBridge:
         
         self._local_hls_dir.mkdir(parents=True, exist_ok=True)
         
-        # Thread pool para envio de segmentos
-        self._upload_executor = ThreadPoolExecutor(max_workers=4)
+        # Thread pool MAIOR para upload paralelo agressivo
+        self._upload_executor = ThreadPoolExecutor(max_workers=8)
         
         # Sessão HTTP persistente para melhor performance
         self._http_session = requests.Session()
@@ -204,7 +204,7 @@ class HLSRelayBridge:
         uploaded_segments: Dict[str, set] = {}
         
         while self._running:
-            time.sleep(0.5)  # Checar a cada 500ms (mais estável)
+            time.sleep(0.15)  # 150ms - balance entre velocidade e estabilidade
             
             for stream_key, stream in list(self.active_streams.items()):
                 if stream.status != "running":
@@ -269,30 +269,40 @@ class HLSRelayBridge:
                     uploaded_segments[stream_key] = set(sorted_segments[-20:])
     
     def _upload_segment(self, stream_key: str, file_path: Path, filename: str):
-        """Envia um segmento .ts para o servidor"""
-        try:
-            url = f"{self.relay_server_url}/relay/{stream_key}/{filename}"
-            
-            with open(file_path, 'rb') as f:
-                content = f.read()
-            
-            response = self._http_session.put(
-                url,
-                data=content,
-                headers={'Content-Type': 'video/mp2t'},
-                timeout=5
-            )
-            
-            if response.status_code in (200, 201):
-                if stream_key in self.active_streams:
-                    self.active_streams[stream_key].segments_sent += 1
-                    self.active_streams[stream_key].last_segment_time = time.time()
-                logger.debug(f"✓ Uploaded {filename}")
-            else:
-                logger.warning(f"Upload failed {filename}: {response.status_code}")
+        """Envia um segmento .ts para o servidor com retry"""
+        max_retries = 2
+        
+        for attempt in range(max_retries + 1):
+            try:
+                url = f"{self.relay_server_url}/relay/{stream_key}/{filename}"
                 
-        except Exception as e:
-            logger.error(f"Error uploading segment {filename}: {e}")
+                with open(file_path, 'rb') as f:
+                    content = f.read()
+                
+                response = self._http_session.put(
+                    url,
+                    data=content,
+                    headers={
+                        'Content-Type': 'video/mp2t',
+                        'Connection': 'keep-alive'
+                    },
+                    timeout=3
+                )
+                
+                if response.status_code in (200, 201):
+                    if stream_key in self.active_streams:
+                        self.active_streams[stream_key].segments_sent += 1
+                        self.active_streams[stream_key].last_segment_time = time.time()
+                    logger.debug(f"✓ Uploaded {filename}")
+                    return
+                else:
+                    logger.warning(f"Upload failed {filename}: {response.status_code}")
+                    
+            except Exception as e:
+                if attempt < max_retries:
+                    time.sleep(0.1)  # Pequeno delay antes de retry
+                    continue
+                logger.error(f"Error uploading segment {filename}: {e}")
     
     def _upload_playlist(self, stream_key: str, file_path: Path, filename: str):
         """Envia playlist .m3u8 para o servidor"""
@@ -351,46 +361,52 @@ class HLSRelayBridge:
         
         output_playlist = stream_dir / "index.m3u8"
         
-        # Comando FFmpeg otimizado para REPRODUÇÃO SUAVE
-        # Prioriza estabilidade sobre latência mínima
+        # Comando FFmpeg LOW LATENCY ESTÁVEL
+        # Target: 1.5-2.5s de latência com estabilidade
         cmd = [
             self._ffmpeg_path,
             "-y",
             "-hide_banner",
             "-loglevel", "warning",
-            # Input options - buffer maior para estabilidade
-            "-fflags", "+genpts+discardcorrupt",
+            # Input - buffer mínimo mas ESTÁVEL
+            "-fflags", "+genpts+discardcorrupt+nobuffer",
             "-flags", "low_delay",
             "-rtsp_transport", "tcp",
             "-rtsp_flags", "prefer_tcp",
             "-timeout", "5000000",
-            "-buffer_size", "1024000",       # Buffer maior para estabilidade
-            "-max_delay", "500000",          # Mais delay permitido
-            "-analyzeduration", "1000000",   # Mais tempo para análise
-            "-probesize", "1000000",
+            "-buffer_size", "512000",        # Buffer razoável para estabilidade
+            "-max_delay", "100000",          # 100ms max delay
+            "-analyzeduration", "500000",    
+            "-probesize", "500000",
+            "-reconnect", "1",               # Auto reconectar
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "2",
             "-i", rtsp_url,
-            # Video encoding - SUAVIDADE > LATÊNCIA
+            # Video encoding - QUALIDADE + BAIXA LATÊNCIA
             "-c:v", "libx264",
-            "-preset", "veryfast",           # veryfast = melhor qualidade que ultrafast
+            "-preset", "veryfast",           # veryfast = bom balance CPU/qualidade
             "-tune", "zerolatency",
-            "-profile:v", "main",            # main profile = melhor compatibilidade
-            "-level", "4.0",
+            "-profile:v", "baseline",
+            "-level", "3.1",
             "-pix_fmt", "yuv420p",
-            "-vf", "scale=1280:-2",          # 720p para melhor qualidade
-            "-r", "25",                      # FPS fixo
-            "-g", "50",                      # GOP = 2s (mais estável)
-            "-keyint_min", "25",             # Keyframe mínimo 1s
-            "-sc_threshold", "0",            # Desativar detecção de cena
-            "-b:v", "1500k",                 # Bitrate maior para qualidade
-            "-maxrate", "2000k",
-            "-bufsize", "3000k",             # Buffer maior = mais suave
-            "-an",                           # Sem áudio
+            "-vf", "scale=1280:-2:flags=bilinear",
+            "-r", "25",                      # 25 FPS estável
+            "-g", "25",                      # GOP = 1s
+            "-keyint_min", "25",
+            "-sc_threshold", "0",
+            "-b:v", "1800k",                 
+            "-maxrate", "2200k",
+            "-bufsize", "1800k",             
+            "-rc-lookahead", "0",
+            "-refs", "1",
+            "-bf", "0",                      # Sem B-frames
+            "-an",
             "-threads", "0",                 # Auto threads
-            # HLS output - segmentos maiores para estabilidade
+            # HLS output - SEGMENTOS CURTOS MAS ESTÁVEIS
             "-f", "hls",
-            "-hls_time", "1",                # Segmentos de 1s (mais estável)
-            "-hls_list_size", "5",           # 5 segmentos = 5s buffer
-            "-hls_flags", "delete_segments+independent_segments+append_list",
+            "-hls_time", "0.5",              # 500ms = bom balance
+            "-hls_list_size", "6",           # 6 segmentos = 3s buffer
+            "-hls_flags", "delete_segments+independent_segments+split_by_time",
             "-hls_segment_type", "mpegts",
             "-hls_segment_filename", str(stream_dir / "seg_%05d.ts"),
             str(output_playlist)

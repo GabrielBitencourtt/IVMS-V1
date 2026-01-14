@@ -70,35 +70,36 @@ class StreamManager:
         stream_dir: Path,
         use_copy: bool = False
     ) -> list:
-        """Constrói comando FFmpeg OTIMIZADO para streaming contínuo"""
+        """Constrói comando FFmpeg OTIMIZADO para LL-HLS (Low-Latency HLS)"""
         
         is_rtsp = source_url.lower().startswith("rtsp://")
         
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
         
-        # Opções globais para stream contínuo
+        # Opções globais para stream contínuo - LOW LATENCY
         cmd.extend([
-            "-fflags", "+genpts+discardcorrupt+nobuffer",
+            "-fflags", "+genpts+discardcorrupt+nobuffer+flush_packets",
             "-flags", "low_delay",
             "-strict", "experimental",
+            "-avioflags", "direct",
         ])
         
-        # Configurações de entrada otimizadas
+        # Configurações de entrada otimizadas para baixa latência
         if is_rtsp:
             cmd.extend([
                 "-rtsp_transport", "tcp",
                 "-rtsp_flags", "prefer_tcp",
                 "-timeout", "5000000",           # 5 segundos timeout
-                "-buffer_size", "1024000",
-                "-max_delay", "500000",
-                "-reorder_queue_size", "500",
-                "-analyzeduration", "1000000",
-                "-probesize", "1000000",
+                "-buffer_size", "512000",        # Buffer menor
+                "-max_delay", "0",               # Sem delay
+                "-reorder_queue_size", "0",      # Sem reorder
+                "-analyzeduration", "500000",    # 0.5s análise
+                "-probesize", "500000",          # 500KB probe
             ])
         else:
             cmd.extend([
-                "-analyzeduration", "1000000",
-                "-probesize", "1000000",
+                "-analyzeduration", "500000",
+                "-probesize", "500000",
             ])
         
         cmd.extend(["-i", source_url])
@@ -110,7 +111,7 @@ class StreamManager:
                 "-bsf:v", "h264_mp4toannexb",
             ])
         else:
-            # Re-encoding ULTRA LOW LATENCY - alvo ~2s
+            # Re-encoding ULTRA LOW LATENCY para LL-HLS
             cmd.extend([
                 "-c:v", "libx264",
                 "-preset", "ultrafast",           # Mais rápido possível
@@ -120,26 +121,28 @@ class StreamManager:
                 "-pix_fmt", "yuv420p",
                 "-vf", "scale=854:-2",            # 480p para menor bitrate
                 "-r", "25",                       # 25 fps
-                "-g", "12",                       # GOP = 0.5s (keyframe a cada 12 frames @ 25fps)
-                "-keyint_min", "12",              # Força keyframe a cada 0.5s
+                "-g", "25",                       # GOP = 1s (keyframe a cada segundo)
+                "-keyint_min", "25",              # Keyframe mínimo 1s
                 "-sc_threshold", "0",             # Desabilita scene change detection
-                "-b:v", "800k",
-                "-maxrate", "900k",
+                "-b:v", "1000k",
+                "-maxrate", "1200k",
                 "-bufsize", "500k",               # Buffer pequeno = baixa latência
                 "-an",                            # SEM ÁUDIO - evita stalls
                 "-threads", "2",
             ])
         
-        # HLS ULTRA LOW LATENCY - segmentos de 0.5s
+        # LL-HLS (Low-Latency HLS) - Configuração completa
         cmd.extend([
             "-f", "hls",
-            "-hls_time", "0.5",                   # Segmentos de 0.5 segundo
-            "-hls_list_size", "3",                # 3 segmentos = 1.5s buffer
-            "-hls_flags", "delete_segments+independent_segments+split_by_time",
+            "-hls_time", "1",                     # Segmentos de 1s
+            "-hls_list_size", "4",                # 4 segmentos na playlist
+            "-hls_flags", "delete_segments+independent_segments+split_by_time+program_date_time",
             "-hls_segment_type", "mpegts",
             "-hls_start_number_source", "datetime",
             "-start_number", "1",
-            "-hls_segment_filename", str(stream_dir / "seg_%03d.ts"),
+            # LL-HLS específico - partial segments
+            "-hls_fmp4_init_filename", "init.mp4",
+            "-hls_segment_filename", str(stream_dir / "seg_%d.ts"),
             str(output_path)
         ])
         

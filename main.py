@@ -1,6 +1,6 @@
 """
 IVMS Pro - Servidor de Streaming
-FastAPI server para servir HLS
+FastAPI server para servir HLS + WebSocket Relay
 
 Modos de operação:
 1. HLS Relay (preferencial): Apenas recebe e serve segmentos HLS do app local
@@ -8,13 +8,17 @@ Modos de operação:
    - Menor carga no servidor, menor latência
    
 2. RTMP Push (fallback): Recebe RTMP e converte para HLS via nginx-rtmp
+
+3. WebSocket Relay (baixa latência): App local envia H.264, servidor faz broadcast
+   - Latência ~1-2s (vs 3-5s do HLS)
+   - Browsers recebem via WebSocket e decodificam com MSE
 """
 
 import os
 import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
@@ -23,6 +27,7 @@ import aiofiles
 import aiofiles.os
 
 from stream_manager import StreamManager
+from websocket_relay import ws_relay, handle_producer, handle_consumer
 
 # Configuração
 HLS_DIR = Path("/tmp/hls")
@@ -713,6 +718,45 @@ async def relay_status():
             })
     
     return {"relay_streams": relay_streams}
+
+
+# ============ WebSocket Relay Endpoints ============
+
+@app.websocket("/ws/produce/{stream_key}")
+async def ws_produce(websocket: WebSocket, stream_key: str):
+    """
+    WebSocket endpoint para producers (app local).
+    
+    Recebe dados H.264 do app local e faz broadcast para consumers.
+    """
+    await handle_producer(websocket, stream_key)
+
+
+@app.websocket("/ws/consume/{stream_key}")
+async def ws_consume(websocket: WebSocket, stream_key: str):
+    """
+    WebSocket endpoint para consumers (browsers).
+    
+    Browsers conectam aqui para receber stream H.264 em tempo real.
+    """
+    await handle_consumer(websocket, stream_key)
+
+
+@app.get("/ws/status")
+async def ws_status():
+    """Status de todas as salas WebSocket"""
+    return {
+        "websocket_rooms": ws_relay.get_all_rooms_status()
+    }
+
+
+@app.get("/ws/status/{stream_key}")
+async def ws_room_status(stream_key: str):
+    """Status de uma sala WebSocket específica"""
+    status = ws_relay.get_room_status(stream_key)
+    if not status:
+        raise HTTPException(status_code=404, detail="Sala não encontrada")
+    return status
 
 
 # ============ Para desenvolvimento local ============

@@ -7,6 +7,9 @@ Pillow>=10.0.0
 # WebSocket server para comunicação com a plataforma
 websockets>=12.0
 
+# WebSocket client para streaming de baixa latência
+websocket-client>=1.7.0
+
 # SSL certificates para funcionar em executáveis PyInstaller
 certifi>=2023.0.0
 

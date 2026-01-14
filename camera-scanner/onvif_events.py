@@ -83,17 +83,36 @@ class OnvifAuth:
     """Gera autenticação WS-Security para ONVIF"""
     
     @staticmethod
-    def create_wsse_header(username: str, password: str) -> str:
-        """Cria header WS-Security com UsernameToken"""
+    def create_wsse_header(username: str, password: str, use_password_text: bool = False) -> str:
+        """Cria header WS-Security com UsernameToken
+        
+        Args:
+            username: Nome de usuário
+            password: Senha
+            use_password_text: Se True, usa PasswordText (plaintext) ao invés de PasswordDigest
+        """
         nonce = py_secrets.token_bytes(16)
         created = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
-        
-        # Password Digest = Base64(SHA1(nonce + created + password))
-        digest_input = nonce + created.encode('utf-8') + password.encode('utf-8')
-        password_digest = base64.b64encode(hashlib.sha1(digest_input).digest()).decode('utf-8')
         nonce_b64 = base64.b64encode(nonce).decode('utf-8')
         
-        return f'''
+        if use_password_text:
+            # PasswordText - senha em texto plano (algumas câmeras Dahua/Intelbras preferem)
+            return f'''
+        <wsse:Security soap:mustUnderstand="1" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+            <wsse:UsernameToken>
+                <wsse:Username>{username}</wsse:Username>
+                <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">{password}</wsse:Password>
+                <wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{nonce_b64}</wsse:Nonce>
+                <wsu:Created>{created}</wsu:Created>
+            </wsse:UsernameToken>
+        </wsse:Security>
+        '''
+        else:
+            # PasswordDigest = Base64(SHA1(nonce + created + password))
+            digest_input = nonce + created.encode('utf-8') + password.encode('utf-8')
+            password_digest = base64.b64encode(hashlib.sha1(digest_input).digest()).decode('utf-8')
+            
+            return f'''
         <wsse:Security soap:mustUnderstand="1" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
             <wsse:UsernameToken>
                 <wsse:Username>{username}</wsse:Username>
@@ -142,52 +161,247 @@ class OnvifEventsClient:
         self.subscription_reference: Optional[str] = None
         self.event_capabilities: Dict = {}
         
+        # Método de autenticação que funcionou (None = ainda não testado)
+        self._working_auth_method: Optional[str] = None
+        
         # Cache de eventos para detectar duplicados
         self._last_events: Dict[str, datetime] = {}
         self._event_cooldown = 2.0  # segundos entre eventos iguais
     
-    def _send_soap_request(self, url: str, action: str, body: str) -> Optional[str]:
-        """Envia requisição SOAP para a câmera"""
-        wsse_header = OnvifAuth.create_wsse_header(self.username, self.password)
+    def _send_soap_request(self, url: str, action: str, body: str, debug: bool = False, try_all_auth: bool = False) -> Optional[str]:
+        """Envia requisição SOAP para a câmera
         
-        envelope = f'''<?xml version="1.0" encoding="UTF-8"?>
-        <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
-                       xmlns:tev="http://www.onvif.org/ver10/events/wsdl"
-                       xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
-            <soap:Header>
-                {wsse_header}
-            </soap:Header>
-            <soap:Body>
-                {body}
-            </soap:Body>
-        </soap:Envelope>'''
-        
+        Args:
+            url: URL do serviço ONVIF
+            action: SOAP action
+            body: Corpo da requisição
+            debug: Se True, loga detalhes
+            try_all_auth: Se True, tenta múltiplos métodos de autenticação
+        """
         headers = {
             'Content-Type': 'application/soap+xml; charset=utf-8',
             'SOAPAction': action,
         }
         
-        try:
-            response = requests.post(url, data=envelope, headers=headers, timeout=10)
-            if response.status_code == 200:
-                return response.text
+        # Gera MessageID único para WS-Addressing
+        import uuid
+        message_id = f"urn:uuid:{uuid.uuid4()}"
+        
+        # WS-Addressing headers (obrigatório para algumas câmeras)
+        wsa_headers = f'''
+            <wsa:MessageID>{message_id}</wsa:MessageID>
+            <wsa:To>{url}</wsa:To>
+            <wsa:Action>{action}</wsa:Action>
+        '''
+        
+        # Define métodos de autenticação a tentar
+        # Incluindo métodos combinados para câmeras Dahua/Intelbras
+        all_methods = ['http_digest', 'http_digest_wsse', 'wsse_digest', 'wsse_text', 'no_auth']
+        auth_methods = []
+        
+        if try_all_auth:
+            # Se try_all_auth, tenta todos começando pelo que funcionou antes
+            if self._working_auth_method:
+                auth_methods = [self._working_auth_method] + [m for m in all_methods if m != self._working_auth_method]
             else:
-                logger.warning(f"SOAP request failed: {response.status_code}")
-                return None
-        except Exception as e:
-            logger.error(f"SOAP request error: {e}")
-            return None
+                auth_methods = all_methods
+        elif self._working_auth_method:
+            # Se já sabemos qual funciona, usa apenas esse
+            auth_methods = [self._working_auth_method]
+        else:
+            # Padrão: tenta WSSE digest primeiro
+            auth_methods = ['wsse_digest']
+        
+        for auth_method in auth_methods:
+            try:
+                if debug or try_all_auth:
+                    logger.info(f"🔐 Tentando autenticação: {auth_method}")
+                
+                if auth_method == 'http_digest':
+                    # HTTP Digest Auth (comum em Intelbras/Dahua)
+                    from requests.auth import HTTPDigestAuth
+                    
+                    envelope = f'''<?xml version="1.0" encoding="UTF-8"?>
+                    <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+                                   xmlns:tev="http://www.onvif.org/ver10/events/wsdl"
+                                   xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"
+                                   xmlns:wsa="http://www.w3.org/2005/08/addressing">
+                        <soap:Header>
+                            {wsa_headers}
+                        </soap:Header>
+                        <soap:Body>
+                            {body}
+                        </soap:Body>
+                    </soap:Envelope>'''
+                    
+                    response = requests.post(
+                        url, 
+                        data=envelope, 
+                        headers=headers, 
+                        auth=HTTPDigestAuth(self.username, self.password),
+                        timeout=10
+                    )
+                    
+                elif auth_method == 'http_digest_wsse':
+                    # HTTP Digest Auth + WSSE Header (câmeras Dahua/Intelbras para alguns endpoints)
+                    from requests.auth import HTTPDigestAuth
+                    wsse_header = OnvifAuth.create_wsse_header(self.username, self.password, use_password_text=False)
+                    
+                    envelope = f'''<?xml version="1.0" encoding="UTF-8"?>
+                    <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+                                   xmlns:tev="http://www.onvif.org/ver10/events/wsdl"
+                                   xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"
+                                   xmlns:wsa="http://www.w3.org/2005/08/addressing">
+                        <soap:Header>
+                            {wsa_headers}
+                            {wsse_header}
+                        </soap:Header>
+                        <soap:Body>
+                            {body}
+                        </soap:Body>
+                    </soap:Envelope>'''
+                    
+                    response = requests.post(
+                        url, 
+                        data=envelope, 
+                        headers=headers, 
+                        auth=HTTPDigestAuth(self.username, self.password),
+                        timeout=10
+                    )
+                    
+                elif auth_method == 'wsse_text':
+                    # WS-Security com PasswordText
+                    wsse_header = OnvifAuth.create_wsse_header(self.username, self.password, use_password_text=True)
+                    envelope = f'''<?xml version="1.0" encoding="UTF-8"?>
+                    <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+                                   xmlns:tev="http://www.onvif.org/ver10/events/wsdl"
+                                   xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"
+                                   xmlns:wsa="http://www.w3.org/2005/08/addressing">
+                        <soap:Header>
+                            {wsa_headers}
+                            {wsse_header}
+                        </soap:Header>
+                        <soap:Body>
+                            {body}
+                        </soap:Body>
+                    </soap:Envelope>'''
+                    response = requests.post(url, data=envelope, headers=headers, timeout=10)
+                    
+                elif auth_method == 'wsse_digest':
+                    # WS-Security com PasswordDigest
+                    wsse_header = OnvifAuth.create_wsse_header(self.username, self.password, use_password_text=False)
+                    envelope = f'''<?xml version="1.0" encoding="UTF-8"?>
+                    <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+                                   xmlns:tev="http://www.onvif.org/ver10/events/wsdl"
+                                   xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"
+                                   xmlns:wsa="http://www.w3.org/2005/08/addressing">
+                        <soap:Header>
+                            {wsa_headers}
+                            {wsse_header}
+                        </soap:Header>
+                        <soap:Body>
+                            {body}
+                        </soap:Body>
+                    </soap:Envelope>'''
+                    response = requests.post(url, data=envelope, headers=headers, timeout=10)
+                    
+                else:  # no_auth
+                    # Sem autenticação (algumas câmeras permitem)
+                    envelope = f'''<?xml version="1.0" encoding="UTF-8"?>
+                    <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+                                   xmlns:tev="http://www.onvif.org/ver10/events/wsdl"
+                                   xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"
+                                   xmlns:wsa="http://www.w3.org/2005/08/addressing">
+                        <soap:Header>
+                            {wsa_headers}
+                        </soap:Header>
+                        <soap:Body>
+                            {body}
+                        </soap:Body>
+                    </soap:Envelope>'''
+                    response = requests.post(url, data=envelope, headers=headers, timeout=10)
+                
+                if response.status_code == 200:
+                    if try_all_auth and not self._working_auth_method:
+                        self._working_auth_method = auth_method
+                        logger.info(f"✅ Método de autenticação funcionou: {auth_method}")
+                    return response.text
+                elif response.status_code == 401:
+                    logger.info(f"❌ Auth {auth_method} falhou: 401 Unauthorized")
+                    continue
+                else:
+                    # Log detalhado do status code e resposta
+                    logger.info(f"📥 Response {auth_method}: status={response.status_code}")
+                    
+                    # Verifica se é erro de autenticação no SOAP
+                    is_auth_error = False
+                    soap_error_msg = None
+                    if response.text:
+                        try:
+                            root = ET.fromstring(response.text)
+                            fault = root.find('.//{http://www.w3.org/2003/05/soap-envelope}Fault')
+                            if fault is not None:
+                                reason_elem = fault.find('.//{http://www.w3.org/2003/05/soap-envelope}Reason')
+                                reason_text = ""
+                                if reason_elem is not None:
+                                    text_elem = reason_elem.find('.//{http://www.w3.org/2003/05/soap-envelope}Text')
+                                    if text_elem is not None and text_elem.text:
+                                        reason_text = text_elem.text
+                                    elif reason_elem.text:
+                                        reason_text = reason_elem.text
+                                    else:
+                                        reason_text = ET.tostring(reason_elem, encoding='unicode')
+                                
+                                soap_error_msg = reason_text
+                                logger.info(f"📛 SOAP Fault ({auth_method}): {reason_text[:200]}")
+                                
+                                # Verifica se é erro de autenticação
+                                auth_keywords = ['not authorized', 'password', 'authentication', 'credentials', 'unauthorized']
+                                if any(kw in reason_text.lower() for kw in auth_keywords):
+                                    is_auth_error = True
+                                    continue  # Tenta próximo método de auth
+                                else:
+                                    # Outro tipo de erro SOAP - não é problema de auth
+                                    # Se temos try_all_auth, pode ser que outro método funcione
+                                    if try_all_auth:
+                                        continue
+                                    return None
+                        except Exception as parse_err:
+                            logger.debug(f"Erro ao parsear resposta: {parse_err}")
+                            logger.info(f"📄 Response body: {response.text[:300]}")
+                    
+                    if is_auth_error:
+                        continue
+                    elif soap_error_msg is None and try_all_auth:
+                        # Não conseguiu parsear mas estamos tentando todos, continua
+                        logger.info(f"⚠️ Resposta inesperada, tentando próximo método...")
+                        continue
+                    elif soap_error_msg is None:
+                        logger.warning(f"SOAP request failed: {response.status_code}")
+                        logger.debug(f"Response: {response.text[:500] if response.text else 'empty'}")
+                        return None
+                        
+            except Exception as e:
+                logger.error(f"❌ Auth {auth_method} erro: {e}")
+                if not try_all_auth:
+                    return None
+                continue
+        
+        logger.warning("❌ Nenhum método de autenticação funcionou")
+        return None
     
     def check_capabilities(self) -> bool:
-        """Verifica se a câmera suporta eventos ONVIF"""
+        """Verifica se a câmera suporta eventos ONVIF (testa múltiplos métodos de auth)"""
         body = '''
             <tev:GetServiceCapabilities/>
         '''
         
+        # Primeira requisição: tenta todos os métodos de autenticação
         response = self._send_soap_request(
             self.events_url,
             'http://www.onvif.org/ver10/events/wsdl/EventPortType/GetServiceCapabilitiesRequest',
-            body
+            body,
+            try_all_auth=True
         )
         
         if response:
@@ -203,6 +417,8 @@ class OnvifEventsClient:
                         'persistent_notification': caps.get('WSPersistentNotificationInterfaceSupport', 'false') == 'true',
                     }
                     logger.info(f"📋 Capabilities: {self.event_capabilities}")
+                    if self._working_auth_method:
+                        logger.info(f"🔐 Método de autenticação: {self._working_auth_method}")
                     return True
             except ET.ParseError as e:
                 logger.error(f"XML parse error: {e}")
@@ -211,35 +427,99 @@ class OnvifEventsClient:
     
     def create_pull_point_subscription(self) -> bool:
         """Cria subscription para receber eventos via pull"""
-        body = '''
-            <tev:CreatePullPointSubscription>
+        # Tenta diferentes formatos de requisição (compatibilidade com várias marcas)
+        bodies = [
+            # Formato Dahua/Intelbras específico
+            '''<tev:CreatePullPointSubscription xmlns:tev="http://www.onvif.org/ver10/events/wsdl">
+                <tev:InitialTerminationTime>PT600S</tev:InitialTerminationTime>
+            </tev:CreatePullPointSubscription>''',
+            # Formato padrão ONVIF
+            '''<tev:CreatePullPointSubscription>
                 <tev:InitialTerminationTime>PT1H</tev:InitialTerminationTime>
-            </tev:CreatePullPointSubscription>
-        '''
+            </tev:CreatePullPointSubscription>''',
+            # Formato alternativo (sem InitialTerminationTime)
+            '''<tev:CreatePullPointSubscription/>''',
+            # Formato com filter vazio (algumas câmeras precisam)
+            '''<tev:CreatePullPointSubscription>
+                <tev:Filter/>
+                <tev:InitialTerminationTime>PT60M</tev:InitialTerminationTime>
+            </tev:CreatePullPointSubscription>''',
+            # Formato minimalista para Dahua
+            '''<CreatePullPointSubscription xmlns="http://www.onvif.org/ver10/events/wsdl"/>''',
+        ]
         
-        response = self._send_soap_request(
-            self.events_url,
-            'http://www.onvif.org/ver10/events/wsdl/EventPortType/CreatePullPointSubscriptionRequest',
-            body
-        )
-        
-        if response:
-            try:
-                root = ET.fromstring(response)
-                
-                # Extrai SubscriptionReference
-                sub_ref = root.find('.//tev:SubscriptionReference/wsnt:Address', NAMESPACES)
-                if sub_ref is None:
-                    sub_ref = root.find('.//{http://www.w3.org/2005/08/addressing}Address')
-                
-                if sub_ref is not None and sub_ref.text:
-                    self.subscription_reference = sub_ref.text
-                    logger.info(f"✅ Pull Point criado: {self.subscription_reference}")
-                    return True
+        for i, body in enumerate(bodies):
+            logger.info(f"📋 Tentando formato {i+1}/{len(bodies)} de CreatePullPointSubscription...")
+            
+            response = self._send_soap_request(
+                self.events_url,
+                'http://www.onvif.org/ver10/events/wsdl/EventPortType/CreatePullPointSubscriptionRequest',
+                body,
+                debug=True,
+                try_all_auth=True  # Tenta todos os métodos de auth se necessário
+            )
+            
+            if response:
+                try:
+                    root = ET.fromstring(response)
                     
-            except ET.ParseError as e:
-                logger.error(f"XML parse error: {e}")
+                    # Verifica se é um Fault SOAP
+                    fault = root.find('.//{http://www.w3.org/2003/05/soap-envelope}Fault')
+                    if fault is not None:
+                        # Extrai detalhes do erro
+                        reason = fault.find('.//{http://www.w3.org/2003/05/soap-envelope}Text')
+                        reason_text = reason.text if reason is not None else "Unknown"
+                        
+                        # Procura por descrição detalhada
+                        descr = fault.find('.//{http://docs.oasis-open.org/wsrf/bf-2}Description')
+                        descr_text = descr.text if descr is not None else ""
+                        
+                        # Log completo do erro
+                        logger.warning(f"⚠️ SOAP Fault (formato {i+1}): {reason_text}")
+                        if descr_text:
+                            logger.warning(f"   Descrição: {descr_text}")
+                        
+                        # Se o erro indica limite de subscriptions, mostra mensagem clara
+                        if 'limit' in reason_text.lower() or 'maximum' in reason_text.lower():
+                            logger.error("❌ Limite de subscriptions atingido! Reinicie a câmera para limpar.")
+                            return False
+                        
+                        # Continua tentando outros formatos, mas se já tentou com auth funcionando, é outro problema
+                        continue
+                    
+                    # Log do XML para debug (só se não for fault)
+                    logger.info(f"📄 Response XML (formato {i+1}): {response[:800]}")
+                    
+                    # Extrai SubscriptionReference - tenta vários formatos
+                    sub_ref = root.find('.//tev:SubscriptionReference/wsnt:Address', NAMESPACES)
+                    if sub_ref is None:
+                        sub_ref = root.find('.//{http://www.w3.org/2005/08/addressing}Address')
+                    if sub_ref is None:
+                        # Tenta formato alternativo
+                        sub_ref = root.find('.//wsnt:SubscriptionReference/wsa:Address', 
+                                          {**NAMESPACES, 'wsa': 'http://www.w3.org/2005/08/addressing'})
+                    if sub_ref is None:
+                        # Procura qualquer elemento Address
+                        for elem in root.iter():
+                            if 'Address' in elem.tag and elem.text and 'http' in elem.text:
+                                sub_ref = elem
+                                logger.info(f"🔍 Encontrado Address via fallback: tag={elem.tag}")
+                                break
+                    
+                    if sub_ref is not None and sub_ref.text:
+                        self.subscription_reference = sub_ref.text
+                        logger.info(f"✅ Pull Point criado: {self.subscription_reference}")
+                        return True
+                    else:
+                        logger.warning(f"⚠️ Resposta recebida mas sem SubscriptionReference")
+                        
+                except ET.ParseError as e:
+                    logger.error(f"XML parse error: {e}")
+            else:
+                logger.debug(f"Formato {i+1} não retornou resposta válida")
         
+        logger.error("❌ Nenhum formato de CreatePullPointSubscription funcionou")
+        logger.error("💡 Dica: Tente reiniciar a câmera para limpar subscriptions pendentes")
         return False
     
     def pull_messages(self) -> List[OnvifEvent]:
@@ -247,23 +527,53 @@ class OnvifEventsClient:
         if not self.subscription_reference:
             return []
         
-        body = '''
-            <tev:PullMessages>
+        # Formatos de PullMessages para diferentes fabricantes
+        bodies = [
+            # Formato padrão ONVIF
+            '''<tev:PullMessages>
                 <tev:Timeout>PT5S</tev:Timeout>
                 <tev:MessageLimit>100</tev:MessageLimit>
-            </tev:PullMessages>
-        '''
+            </tev:PullMessages>''',
+            # Formato Dahua/Intelbras - namespace explícito
+            '''<PullMessages xmlns="http://www.onvif.org/ver10/events/wsdl">
+                <Timeout>PT5S</Timeout>
+                <MessageLimit>100</MessageLimit>
+            </PullMessages>''',
+            # Formato alternativo com prefixo wsnt
+            '''<wsnt:PullMessages xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
+                <wsnt:Timeout>PT5S</wsnt:Timeout>
+                <wsnt:MessageLimit>100</wsnt:MessageLimit>
+            </wsnt:PullMessages>''',
+        ]
         
         # Usa o subscription_reference como URL
         url = self.subscription_reference
         if not url.startswith('http'):
             url = f"{self.base_url}{url}"
         
-        response = self._send_soap_request(
-            url,
-            'http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessagesRequest',
-            body
-        )
+        # Log da URL para debug
+        logger.debug(f"📡 PullMessages URL: {url}")
+        
+        # Tenta cada formato de body
+        for i, body in enumerate(bodies):
+            response = self._send_soap_request(
+                url,
+                'http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessagesRequest',
+                body,
+                try_all_auth=(i == 0)  # Só tenta todos os auth no primeiro formato
+            )
+            
+            if response:
+                # Verifica se não é um Fault
+                if '<Fault' not in response and 'Fault>' not in response:
+                    # Log apenas na primeira vez que um formato funciona
+                    if not hasattr(self, '_working_pull_format'):
+                        logger.info(f"✅ Formato PullMessages {i+1} funcionou")
+                        self._working_pull_format = i
+                    break
+        else:
+            # Nenhum formato funcionou sem Fault
+            response = None
         
         events = []
         
@@ -271,16 +581,53 @@ class OnvifEventsClient:
             try:
                 root = ET.fromstring(response)
                 
+                # Verifica se é um Fault SOAP
+                fault = root.find('.//{http://www.w3.org/2003/05/soap-envelope}Fault')
+                if fault is not None:
+                    reason = fault.find('.//{http://www.w3.org/2003/05/soap-envelope}Text')
+                    reason_text = reason.text if reason is not None else "Unknown"
+                    logger.warning(f"⚠️ PullMessages SOAP Fault: {reason_text}")
+                    # Se o erro indica subscription inválida, marca para reconectar
+                    if 'invalid' in reason_text.lower() or 'not found' in reason_text.lower():
+                        logger.error("❌ Subscription inválida - precisa reconectar")
+                        self.subscription_reference = None
+                    return []
+                
+                # Log da resposta para debug (primeiros 500 chars)
+                logger.debug(f"📄 PullMessages response: {response[:500]}")
+                
                 # Parse notification messages
                 messages = root.findall('.//wsnt:NotificationMessage', NAMESPACES)
                 
+                # Também tenta namespace alternativo para Dahua/Intelbras
+                if not messages:
+                    messages = root.findall('.//{http://docs.oasis-open.org/wsn/b-2}NotificationMessage')
+                
+                # Log de debug para ver quantas mensagens vieram
+                if messages:
+                    logger.info(f"📨 Recebidas {len(messages)} mensagens ONVIF")
+                else:
+                    # Log apenas a cada 30 segundos para não spammar
+                    if not hasattr(self, '_last_empty_log') or (datetime.now() - self._last_empty_log).total_seconds() > 30:
+                        logger.debug("📭 PullMessages: nenhuma mensagem pendente")
+                        self._last_empty_log = datetime.now()
+                
                 for msg in messages:
+                    # Log do XML da mensagem para debug
+                    logger.info(f"📄 Message XML: {ET.tostring(msg, encoding='unicode')[:500]}")
+                    
                     event = self._parse_notification_message(msg)
                     if event:
                         events.append(event)
+                    else:
+                        logger.debug("⚠️ Mensagem não gerou evento (cooldown ou parsing)")
                         
             except ET.ParseError as e:
                 logger.error(f"XML parse error: {e}")
+                logger.debug(f"Response: {response[:500]}")
+        else:
+            # Log se não recebeu resposta - pode indicar problema de auth
+            logger.warning("⚠️ PullMessages sem resposta - possível problema de autenticação")
         
         return events
     
@@ -389,10 +736,16 @@ class OnvifEventsClient:
     def _poll_loop(self):
         """Loop de polling para eventos"""
         logger.info(f"🔄 Iniciando poll loop para {self.camera_name}")
+        poll_count = 0
         
         while self.running:
             try:
                 events = self.pull_messages()
+                poll_count += 1
+                
+                # Log periódico para confirmar que está funcionando
+                if poll_count % 30 == 0:  # A cada 30 polls (~30 segundos)
+                    logger.info(f"🔄 Poll #{poll_count} para {self.camera_name} - aguardando eventos...")
                 
                 for event in events:
                     logger.info(f"📥 Evento: {event.event_type} de {event.camera_name}")

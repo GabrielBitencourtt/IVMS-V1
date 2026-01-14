@@ -85,10 +85,16 @@ def build_executable():
         "--hidden-import=websockets",
         "--hidden-import=websockets.server",
         "--hidden-import=websockets.client",
+        # Requests para ONVIF
+        "--hidden-import=requests",
         # Módulos do projeto
         f"--add-data={os.path.join(base_dir, 'stream_bridge.py')}{os.pathsep}.",
         f"--add-data={os.path.join(base_dir, 'websocket_server.py')}{os.pathsep}.",
         f"--add-data={os.path.join(base_dir, 'ffmpeg_installer.py')}{os.pathsep}.",
+        f"--add-data={os.path.join(base_dir, 'cloud_agent.py')}{os.pathsep}.",
+        f"--add-data={os.path.join(base_dir, 'onvif_events.py')}{os.pathsep}.",
+        f"--add-data={os.path.join(base_dir, 'rtsp_tester.py')}{os.pathsep}.",
+        f"--add-data={os.path.join(base_dir, 'scanner.py')}{os.pathsep}.",
     ]
     
     # Opções específicas por plataforma

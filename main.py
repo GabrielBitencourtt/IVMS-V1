@@ -498,6 +498,7 @@ async def rtmp_on_publish(request: Request):
 async def rtmp_on_publish_done(request: Request):
     """
     Callback chamado pelo nginx-rtmp quando um stream termina.
+    NÃO remove o stream, apenas marca como parado para permitir reconexão.
     """
     try:
         form = await request.form()
@@ -505,15 +506,71 @@ async def rtmp_on_publish_done(request: Request):
         
         print(f"🛑 RTMP stream ended: {stream_key}")
         
-        # Atualizar status no manager
+        # Apenas atualizar status - NÃO remover para permitir reconexão fácil
         if stream_key and stream_key in stream_manager.streams:
-            stream_manager.streams[stream_key]["status"] = "stopped"
+            stream_manager.streams[stream_key]["status"] = "waiting"  # Aguardando reconexão
+            stream_manager.streams[stream_key]["last_disconnect"] = __import__('time').time()
         
         return Response(status_code=200)
         
     except Exception as e:
         print(f"❌ Error in on_publish_done: {e}")
         return Response(status_code=200)
+
+
+@app.post("/streams/{stream_key}/reset")
+async def reset_stream(stream_key: str):
+    """
+    Reseta o estado de um stream para permitir reconexão.
+    Útil quando a câmera precisa reconectar mas o estado está inconsistente.
+    """
+    print(f"🔄 Resetting stream state: {stream_key}")
+    
+    # Limpar processo FFmpeg se existir
+    if stream_key in stream_manager.processes:
+        process = stream_manager.processes[stream_key]
+        if process.poll() is None:
+            try:
+                import signal
+                import os as os_module
+                if os_module.name != 'nt':
+                    os_module.killpg(os_module.getpgid(process.pid), signal.SIGKILL)
+                else:
+                    process.kill()
+            except:
+                pass
+        del stream_manager.processes[stream_key]
+    
+    # Cancelar watchdog
+    if stream_key in stream_manager.watchdog_tasks:
+        task = stream_manager.watchdog_tasks[stream_key]
+        if not task.done():
+            task.cancel()
+        del stream_manager.watchdog_tasks[stream_key]
+    
+    # Limpar arquivos HLS antigos
+    stream_dir = HLS_DIR / stream_key
+    if stream_dir.exists():
+        import shutil
+        try:
+            shutil.rmtree(stream_dir)
+            stream_dir.mkdir(parents=True, exist_ok=True)
+            print(f"   Cleaned HLS directory for {stream_key}")
+        except Exception as e:
+            print(f"   Error cleaning HLS dir: {e}")
+    
+    # Resetar ou criar entrada do stream
+    stream_manager.streams[stream_key] = {
+        "name": stream_key,
+        "source_url": "",
+        "status": "waiting",
+        "mode": "rtmp-push",
+        "dir": str(stream_dir),
+        "start_time": __import__('time').time(),
+        "restart_count": 0,
+    }
+    
+    return {"message": "Stream reset", "stream_key": stream_key, "status": "waiting"}
 
 
 # ============ Para desenvolvimento local ============

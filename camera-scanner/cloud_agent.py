@@ -5,6 +5,8 @@ Este agente roda na rede do cliente e se comunica com o cloud via HTTPS/WSS
 Inclui suporte a eventos ONVIF para Motion Detection, Analytics, etc.
 """
 
+AGENT_VERSION = "1.6.0"  # Versão com auto-start ONVIF no login
+
 import os
 import sys
 import json
@@ -40,6 +42,7 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+logger.info(f"🚀 IVMS Cloud Agent v{AGENT_VERSION} iniciando...")
 
 # Tenta importar cliente ONVIF
 ONVIF_AVAILABLE = False
@@ -230,7 +233,7 @@ class CloudAgent:
     def send_heartbeat(self) -> List[Dict]:
         """Envia heartbeat e retorna comandos pendentes"""
         try:
-            # Coleta status das câmeras ativas
+            # Coleta status das câmeras ativas (streams)
             camera_statuses = []
             with self.streams_lock:
                 for stream in self.streams.values():
@@ -239,6 +242,16 @@ class CloudAgent:
                         "status": stream.status,
                         "error_message": stream.error,
                     })
+            
+            # Coleta status das conexões ONVIF
+            onvif_statuses = []
+            for camera_ip, info in self.onvif_cameras.items():
+                onvif_statuses.append({
+                    "camera_ip": camera_ip,
+                    "camera_name": info.get("name", ""),
+                    "onvif_connected": True,
+                    "port": info.get("port", 80),
+                })
             
             response = requests.post(
                 f"{self.cloud_url}/functions/v1/agent-heartbeat",
@@ -250,6 +263,7 @@ class CloudAgent:
                     "client_id": self.client_id,
                     "active_streams": len([s for s in self.streams.values() if s.status == "running"]),
                     "camera_statuses": camera_statuses,
+                    "onvif_statuses": onvif_statuses,
                 },
                 timeout=15,
             )
@@ -297,7 +311,7 @@ class CloudAgent:
         cmd_type = command["command_type"]
         payload = command.get("payload", {})
         
-        logger.info(f"📥 Comando recebido: {cmd_type}")
+        logger.info(f"📥 Comando recebido: '{cmd_type}' (tipo: {type(cmd_type).__name__}, repr: {repr(cmd_type)})")
         
         try:
             if cmd_type == "start_stream":
@@ -324,6 +338,23 @@ class CloudAgent:
                 logger.info(f"🔧 Processando test_onvif com payload: {payload}")
                 result = self._handle_test_onvif(payload)
                 logger.info(f"📤 Resultado test_onvif: {result}")
+                self.send_command_result(cmd_id, "completed", result)
+                
+            elif cmd_type == "start_onvif_events":
+                logger.info(f"📡 Processando start_onvif_events com payload: {payload}")
+                result = self._handle_start_onvif_events(payload)
+                logger.info(f"📤 Resultado start_onvif_events: {result}")
+                self.send_command_result(cmd_id, "completed", result)
+                
+            elif cmd_type == "stop_onvif_events":
+                logger.info(f"🛑 Processando stop_onvif_events com payload: {payload}")
+                result = self._handle_stop_onvif_events(payload)
+                logger.info(f"📤 Resultado stop_onvif_events: {result}")
+                self.send_command_result(cmd_id, "completed", result)
+                
+            elif cmd_type == "get_onvif_status":
+                logger.info(f"📊 Processando get_onvif_status")
+                result = self._handle_get_onvif_status()
                 self.send_command_result(cmd_id, "completed", result)
                 
             else:
@@ -655,6 +686,124 @@ class CloudAgent:
         
         return {}
     
+    def _handle_start_onvif_events(self, payload: Dict) -> Dict:
+        """Inicia escuta de eventos ONVIF para uma câmera específica"""
+        camera_ip = payload.get("camera_ip") or payload.get("ip")
+        camera_port = payload.get("camera_port") or payload.get("port", 80)
+        username = payload.get("username", "admin")
+        password = payload.get("password", "")
+        camera_name = payload.get("camera_name", "")
+        camera_id = payload.get("camera_id", "")
+        
+        if not camera_ip:
+            return {"success": False, "error": "camera_ip ou ip é obrigatório"}
+        
+        if not ONVIF_AVAILABLE:
+            return {
+                "success": False, 
+                "error": "Módulo ONVIF não disponível no agente",
+                "onvif_available": False,
+            }
+        
+        # Verifica se já está escutando
+        if camera_ip in self.onvif_cameras:
+            return {
+                "success": True,
+                "camera_ip": camera_ip,
+                "message": "Já está escutando eventos desta câmera",
+                "already_listening": True,
+            }
+        
+        try:
+            # Inicia escuta
+            self._start_onvif_events(
+                camera_ip=camera_ip,
+                camera_name=camera_name or f"Camera_{camera_ip}",
+                username=username,
+                password=password,
+                port=camera_port,
+            )
+            
+            # Aguarda um pouco para verificar se iniciou
+            time.sleep(1)
+            
+            is_listening = camera_ip in self.onvif_cameras
+            
+            return {
+                "success": is_listening,
+                "camera_ip": camera_ip,
+                "camera_id": camera_id,
+                "camera_name": camera_name,
+                "port": camera_port,
+                "message": "Escuta de eventos ONVIF iniciada" if is_listening else "Falha ao iniciar escuta",
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao iniciar ONVIF events: {e}")
+            return {
+                "success": False,
+                "camera_ip": camera_ip,
+                "error": str(e),
+            }
+    
+    def _handle_stop_onvif_events(self, payload: Dict) -> Dict:
+        """Para escuta de eventos ONVIF de uma câmera"""
+        camera_ip = payload.get("camera_ip") or payload.get("ip")
+        camera_id = payload.get("camera_id", "")
+        
+        if not camera_ip:
+            return {"success": False, "error": "camera_ip ou ip é obrigatório"}
+        
+        if camera_ip not in self.onvif_cameras:
+            return {
+                "success": True,
+                "camera_ip": camera_ip,
+                "message": "Câmera não estava sendo monitorada",
+                "was_listening": False,
+            }
+        
+        try:
+            self._stop_onvif_events(camera_ip)
+            
+            return {
+                "success": True,
+                "camera_ip": camera_ip,
+                "camera_id": camera_id,
+                "message": "Escuta de eventos ONVIF parada",
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao parar ONVIF events: {e}")
+            return {
+                "success": False,
+                "camera_ip": camera_ip,
+                "error": str(e),
+            }
+    
+    def _handle_get_onvif_status(self) -> Dict:
+        """Retorna status de todas as escutas ONVIF ativas"""
+        cameras_listening = []
+        
+        for camera_ip, info in self.onvif_cameras.items():
+            cameras_listening.append({
+                "camera_ip": camera_ip,
+                "camera_name": info.get("name", ""),
+                "port": info.get("port", 80),
+            })
+        
+        manager_status = {}
+        if self.onvif_manager:
+            manager_status = self.onvif_manager.get_status()
+        
+        return {
+            "success": True,
+            "onvif_available": ONVIF_AVAILABLE,
+            "cameras_listening": cameras_listening,
+            "total_cameras": len(cameras_listening),
+            "manager_status": manager_status,
+            "event_buffer_size": len(self._event_buffer),
+        }
+
     def _heartbeat_loop(self):
         """Loop de heartbeat"""
         while self.running:
@@ -670,7 +819,9 @@ class CloudAgent:
             time.sleep(self.heartbeat_interval)
     
     def _monitor_streams(self):
-        """Monitora saúde dos streams e faz flush de eventos"""
+        """Monitora saúde dos streams, conexões ONVIF e faz flush de eventos"""
+        onvif_check_counter = 0
+        
         while self.running:
             with self.streams_lock:
                 for stream_key, stream in list(self.streams.items()):
@@ -683,6 +834,12 @@ class CloudAgent:
             
             # Flush eventos periodicamente
             self._flush_events()
+            
+            # Envia status ONVIF a cada 30 segundos
+            onvif_check_counter += 1
+            if onvif_check_counter >= 6:  # 6 * 5s = 30s
+                self._send_onvif_status_update()
+                onvif_check_counter = 0
             
             time.sleep(5)
     
@@ -818,21 +975,34 @@ class CloudAgent:
             events_to_send = self._event_buffer[:50]
             self._event_buffer = self._event_buffer[50:]
         
+        logger.info(f"📤 Enviando {len(events_to_send)} eventos ONVIF para o cloud...")
+        
         try:
+            headers = {
+                "Content-Type": "application/json",
+                "x-device-token": self.device_token,
+            }
+            
+            # Adiciona apikey se disponível
+            if self.supabase_key:
+                headers["apikey"] = self.supabase_key
+            else:
+                logger.warning("⚠️ supabase_key não disponível, tentando sem apikey")
+            
+            url = f"{self.cloud_url}/functions/v1/receive-camera-event"
+            logger.debug(f"URL: {url}")
+            
             response = requests.post(
-                f"{self.cloud_url}/functions/v1/receive-camera-event",
-                headers={
-                    "Content-Type": "application/json",
-                    "x-device-token": self.device_token,
-                },
+                url,
+                headers=headers,
                 json={"events": events_to_send},
                 timeout=15,
             )
             
             if response.status_code == 200:
-                logger.debug(f"📤 Enviados {len(events_to_send)} eventos para o cloud")
+                logger.info(f"✅ Enviados {len(events_to_send)} eventos com sucesso")
             else:
-                logger.warning(f"⚠️ Falha ao enviar eventos: {response.status_code}")
+                logger.warning(f"⚠️ Falha ao enviar eventos: {response.status_code} - {response.text}")
                 # Recoloca eventos no buffer
                 with self._event_buffer_lock:
                     self._event_buffer = events_to_send + self._event_buffer
@@ -842,6 +1012,107 @@ class CloudAgent:
             # Recoloca eventos no buffer
             with self._event_buffer_lock:
                 self._event_buffer = events_to_send + self._event_buffer
+    
+    def _fetch_onvif_cameras(self) -> List[Dict]:
+        """Busca todas as câmeras com ONVIF habilitado do banco de dados"""
+        if not self.supabase:
+            logger.warning("⚠️ Supabase não inicializado, não é possível buscar câmeras")
+            return []
+        
+        try:
+            logger.info("📋 Buscando câmeras com ONVIF habilitado...")
+            
+            # Busca câmeras do usuário com ONVIF habilitado
+            response = self.supabase.table("cameras").select("*").eq(
+                "user_id", self.user_id
+            ).eq("onvif_enabled", True).execute()
+            
+            cameras = response.data or []
+            logger.info(f"📷 Encontradas {len(cameras)} câmeras com ONVIF habilitado")
+            
+            return cameras
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao buscar câmeras: {e}")
+            return []
+    
+    def _auto_start_onvif_listeners(self):
+        """Inicia automaticamente escuta ONVIF para todas as câmeras habilitadas"""
+        cameras = self._fetch_onvif_cameras()
+        
+        if not cameras:
+            logger.info("📷 Nenhuma câmera com ONVIF habilitado encontrada")
+            return
+        
+        logger.info(f"📡 Iniciando escuta ONVIF automática para {len(cameras)} câmeras...")
+        
+        for camera in cameras:
+            try:
+                # Extrai IP da URL RTSP
+                camera_ip = self._extract_ip_from_rtsp(camera.get("stream_url", ""))
+                
+                if not camera_ip:
+                    logger.warning(f"⚠️ Não foi possível extrair IP da câmera {camera.get('name')}")
+                    continue
+                
+                # Define credenciais ONVIF
+                onvif_port = camera.get("onvif_port", 80) or 80
+                
+                # Se usa credenciais RTSP, extrai da URL
+                if camera.get("onvif_use_rtsp_credentials", True):
+                    creds = self._extract_credentials_from_rtsp(camera.get("stream_url", ""))
+                    if creds:
+                        username = creds.get("username", "admin")
+                        password = creds.get("password", "")
+                    else:
+                        username = camera.get("onvif_username", "admin") or "admin"
+                        password = camera.get("onvif_password", "") or ""
+                else:
+                    username = camera.get("onvif_username", "admin") or "admin"
+                    password = camera.get("onvif_password", "") or ""
+                
+                camera_name = camera.get("name", f"Camera_{camera_ip}")
+                
+                logger.info(f"📡 Iniciando ONVIF para {camera_name} ({camera_ip}:{onvif_port})")
+                
+                # Inicia escuta ONVIF
+                self._start_onvif_events(
+                    camera_ip=camera_ip,
+                    camera_name=camera_name,
+                    username=username,
+                    password=password,
+                    port=onvif_port,
+                )
+                
+                # Pequeno delay entre câmeras para não sobrecarregar
+                time.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"❌ Erro ao iniciar ONVIF para câmera {camera.get('name')}: {e}")
+    
+    def _send_onvif_status_update(self):
+        """Envia status das conexões ONVIF para o cloud"""
+        if not self.supabase or not self.onvif_cameras:
+            return
+        
+        try:
+            # Prepara status das câmeras ONVIF
+            onvif_statuses = []
+            
+            for camera_ip, info in self.onvif_cameras.items():
+                status_data = {
+                    "camera_ip": camera_ip,
+                    "camera_name": info.get("name", ""),
+                    "onvif_connected": True,
+                    "port": info.get("port", 80),
+                }
+                onvif_statuses.append(status_data)
+            
+            # Inclui status no próximo heartbeat (via metadata)
+            logger.debug(f"📊 ONVIF status: {len(onvif_statuses)} câmeras conectadas")
+            
+        except Exception as e:
+            logger.debug(f"Erro ao preparar status ONVIF: {e}")
     
     def start(self):
         """Inicia o agente"""
@@ -860,6 +1131,12 @@ class CloudAgent:
         
         self.monitor_thread = threading.Thread(target=self._monitor_streams, daemon=True)
         self.monitor_thread.start()
+        
+        # AUTO-START: Inicia escuta ONVIF para todas as câmeras habilitadas
+        if self.enable_onvif_events:
+            logger.info("📡 Iniciando auto-start ONVIF...")
+            onvif_thread = threading.Thread(target=self._auto_start_onvif_listeners, daemon=True)
+            onvif_thread.start()
         
         logger.info("✅ Agente iniciado e conectado ao cloud!")
         logger.info(f"📡 Heartbeat a cada {self.heartbeat_interval}s")

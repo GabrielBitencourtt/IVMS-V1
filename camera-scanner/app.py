@@ -31,6 +31,15 @@ except ImportError:
     ImageTk = None
     print("⚠ pystray ou PIL não instalado. Ícone na bandeja do sistema não disponível.")
 
+# ONVIF Events support
+ONVIF_AVAILABLE = False
+try:
+    from onvif_events import OnvifEventsManager, OnvifEvent, OnvifEventsClient, OnvifAuth
+    ONVIF_AVAILABLE = True
+    print("✓ ONVIF Events disponível")
+except ImportError:
+    print("⚠ ONVIF Events não disponível (onvif_events.py não encontrado)")
+
 # Configuração
 SUPABASE_URL = "https://cedkflgtubaologqjker.supabase.co"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNlZGtmbGd0dWJhb2xvZ3Fqa2VyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjgxNDgyMTksImV4cCI6MjA4MzcyNDIxOX0.VnJBlll6_aiSTzNg92zamW2d-V523yZW7oM28sQlL-E"
@@ -443,6 +452,10 @@ class SupabaseClient:
         # Cloud command polling thread
         self._command_polling_thread = None
         self._command_polling_running = False
+        
+        # ONVIF Events Manager
+        self._onvif_manager: Optional['OnvifEventsManager'] = None
+        self._onvif_cameras: Dict[str, Dict] = {}  # IP -> {username, password, name, camera_id}
     
     def check_and_install_ffmpeg(self, progress_callback: Optional[Callable] = None) -> bool:
         """Verifica e instala FFmpeg se necessário, com callbacks de progresso"""
@@ -728,8 +741,17 @@ class SupabaseClient:
                     "hostname": self.hostname,
                     "local_ip": self.local_ip,
                     "ffmpeg_installed": self.ffmpeg_installed,
-                    "active_streams": self.active_streams
+                    "active_streams": self.active_streams,
+                    "onvif_available": ONVIF_AVAILABLE,
                 }
+            elif cmd_type == "test_onvif":
+                result = self._handle_test_onvif_command(payload)
+            elif cmd_type == "start_onvif_events":
+                result = self._handle_start_onvif_events_command(payload)
+            elif cmd_type == "stop_onvif_events":
+                result = self._handle_stop_onvif_events_command(payload)
+            elif cmd_type == "get_onvif_status":
+                result = self._handle_get_onvif_status_command()
             else:
                 error_message = f"Comando desconhecido: {cmd_type}"
             
@@ -990,6 +1012,344 @@ class SupabaseClient:
             if lines:
                 return lines[-1][:200]
             return "Erro ao conectar na câmera"
+    
+    def _handle_test_onvif_command(self, payload: Dict) -> Dict:
+        """Testa conectividade ONVIF e retorna capabilities da câmera"""
+        camera_ip = payload.get("camera_ip") or payload.get("ip")
+        camera_port = payload.get("camera_port") or payload.get("port", 80)
+        username = payload.get("username", "admin")
+        password = payload.get("password", "")
+        
+        if not camera_ip:
+            return {"success": False, "error": "camera_ip ou ip é obrigatório"}
+        
+        if not ONVIF_AVAILABLE:
+            return {
+                "success": False, 
+                "error": "Módulo ONVIF não disponível no agente",
+                "onvif_available": False,
+            }
+        
+        import time
+        start_time = time.time()
+        
+        try:
+            test_client = OnvifEventsClient(
+                camera_ip=camera_ip,
+                camera_port=camera_port,
+                username=username,
+                password=password,
+                camera_name="test",
+            )
+            
+            # Testa capabilities
+            has_capabilities = test_client.check_capabilities()
+            capabilities = test_client.event_capabilities if has_capabilities else {}
+            
+            # Tenta criar subscription para verificar suporte completo
+            subscription_ok = False
+            subscription_error = None
+            
+            if has_capabilities:
+                try:
+                    subscription_ok = test_client.create_pull_point_subscription()
+                except Exception as sub_e:
+                    subscription_error = str(sub_e)
+            
+            response_time = int((time.time() - start_time) * 1000)
+            
+            # Tenta obter informações do dispositivo
+            device_info = self._get_onvif_device_info(camera_ip, camera_port, username, password)
+            
+            return {
+                "success": has_capabilities,
+                "camera_ip": camera_ip,
+                "camera_port": camera_port,
+                "response_time_ms": response_time,
+                "onvif_available": True,
+                "capabilities": capabilities,
+                "pull_point_support": capabilities.get("pull_point", False),
+                "basic_notification_support": capabilities.get("basic_notification_interface", False),
+                "subscription_test": subscription_ok,
+                "subscription_error": subscription_error,
+                "device_info": device_info,
+                "message": "Câmera suporta eventos ONVIF" if has_capabilities else "Câmera não suporta eventos ONVIF ou credenciais inválidas",
+            }
+            
+        except Exception as e:
+            response_time = int((time.time() - start_time) * 1000)
+            logger.error(f"❌ Erro ao testar ONVIF: {e}")
+            return {
+                "success": False,
+                "camera_ip": camera_ip,
+                "response_time_ms": response_time,
+                "error": str(e),
+                "onvif_available": True,
+                "message": f"Erro ao conectar: {str(e)}",
+            }
+    
+    def _get_onvif_device_info(self, camera_ip: str, camera_port: int, username: str, password: str) -> Dict:
+        """Obtém informações do dispositivo via ONVIF"""
+        if not ONVIF_AVAILABLE:
+            return {}
+            
+        try:
+            import requests
+            import xml.etree.ElementTree as ET
+            
+            wsse_header = OnvifAuth.create_wsse_header(username, password)
+            
+            envelope = f'''<?xml version="1.0" encoding="UTF-8"?>
+            <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+                           xmlns:tds="http://www.onvif.org/ver10/device/wsdl">
+                <soap:Header>
+                    {wsse_header}
+                </soap:Header>
+                <soap:Body>
+                    <tds:GetDeviceInformation/>
+                </soap:Body>
+            </soap:Envelope>'''
+            
+            response = requests.post(
+                f"http://{camera_ip}:{camera_port}/onvif/device_service",
+                data=envelope,
+                headers={
+                    'Content-Type': 'application/soap+xml; charset=utf-8',
+                    'SOAPAction': 'http://www.onvif.org/ver10/device/wsdl/GetDeviceInformation',
+                },
+                timeout=5,
+            )
+            
+            if response.status_code == 200:
+                root = ET.fromstring(response.text)
+                ns = {'tds': 'http://www.onvif.org/ver10/device/wsdl'}
+                info = root.find('.//tds:GetDeviceInformationResponse', ns)
+                
+                if info is not None:
+                    return {
+                        "manufacturer": info.findtext('tds:Manufacturer', '', ns),
+                        "model": info.findtext('tds:Model', '', ns),
+                        "firmware_version": info.findtext('tds:FirmwareVersion', '', ns),
+                        "serial_number": info.findtext('tds:SerialNumber', '', ns),
+                    }
+        except Exception as e:
+            logger.debug(f"Não foi possível obter info do dispositivo: {e}")
+        
+        return {}
+    
+    def _handle_start_onvif_events_command(self, payload: Dict) -> Dict:
+        """Inicia escuta de eventos ONVIF para uma câmera específica"""
+        camera_ip = payload.get("camera_ip") or payload.get("ip")
+        camera_port = payload.get("camera_port") or payload.get("port", 80)
+        username = payload.get("username", "admin")
+        password = payload.get("password", "")
+        camera_name = payload.get("camera_name", "")
+        camera_id = payload.get("camera_id", "")
+        
+        logger.info(f"🔔 ONVIF Events - IP: {camera_ip}, Port: {camera_port}, User: {username}, Pass: {'*' * len(password) if password else '(vazio)'}")
+        
+        if not camera_ip:
+            return {"success": False, "error": "camera_ip ou ip é obrigatório"}
+        
+        if not ONVIF_AVAILABLE:
+            return {
+                "success": False, 
+                "error": "Módulo ONVIF não disponível no agente",
+                "onvif_available": False,
+            }
+        
+        # Verifica se já está escutando
+        if camera_ip in self._onvif_cameras:
+            return {
+                "success": True,
+                "camera_ip": camera_ip,
+                "already_listening": True,
+                "message": f"Já escutando eventos de {camera_ip}",
+            }
+        
+        try:
+            # Inicializa ONVIF Manager se necessário
+            if self._onvif_manager is None:
+                self._onvif_manager = OnvifEventsManager(
+                    event_callback=lambda event: self._on_onvif_event(event)
+                )
+            
+            # Adiciona câmera ao manager
+            success = self._onvif_manager.add_camera(
+                camera_ip=camera_ip,
+                camera_port=camera_port,
+                username=username,
+                password=password,
+                camera_name=camera_name or camera_ip,
+            )
+            
+            if success:
+                self._onvif_cameras[camera_ip] = {
+                    "username": username,
+                    "password": password,
+                    "camera_name": camera_name,
+                    "camera_id": camera_id,
+                    "camera_port": camera_port,
+                }
+                logger.info(f"📡 Escuta ONVIF iniciada para {camera_ip}")
+                return {
+                    "success": True,
+                    "camera_ip": camera_ip,
+                    "message": f"Escuta de eventos ONVIF iniciada para {camera_name or camera_ip}",
+                }
+            else:
+                return {
+                    "success": False,
+                    "camera_ip": camera_ip,
+                    "error": "Falha ao iniciar escuta - câmera pode não suportar eventos ONVIF",
+                }
+                
+        except Exception as e:
+            logger.error(f"❌ Erro ao iniciar escuta ONVIF: {e}")
+            return {
+                "success": False,
+                "camera_ip": camera_ip,
+                "error": str(e),
+            }
+    
+    def _handle_stop_onvif_events_command(self, payload: Dict) -> Dict:
+        """Para escuta de eventos ONVIF de uma câmera"""
+        camera_ip = payload.get("camera_ip") or payload.get("ip")
+        
+        if not camera_ip:
+            return {"success": False, "error": "camera_ip ou ip é obrigatório"}
+        
+        if camera_ip not in self._onvif_cameras:
+            return {
+                "success": False,
+                "camera_ip": camera_ip,
+                "error": "Câmera não está sendo monitorada",
+            }
+        
+        try:
+            if self._onvif_manager:
+                self._onvif_manager.remove_camera(camera_ip)
+            
+            del self._onvif_cameras[camera_ip]
+            
+            logger.info(f"🛑 Escuta ONVIF parada para {camera_ip}")
+            return {
+                "success": True,
+                "camera_ip": camera_ip,
+                "message": f"Escuta de eventos parada para {camera_ip}",
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao parar escuta ONVIF: {e}")
+            return {
+                "success": False,
+                "camera_ip": camera_ip,
+                "error": str(e),
+            }
+    
+    def _handle_get_onvif_status_command(self) -> Dict:
+        """Retorna status de todas as escutas ONVIF ativas"""
+        cameras = []
+        
+        for ip, info in self._onvif_cameras.items():
+            cameras.append({
+                "camera_ip": ip,
+                "camera_name": info.get("camera_name", ip),
+                "camera_id": info.get("camera_id", ""),
+                "listening": True,
+            })
+        
+        return {
+            "success": True,
+            "onvif_available": ONVIF_AVAILABLE,
+            "active_listeners": len(cameras),
+            "cameras": cameras,
+        }
+    
+    def _on_onvif_event(self, event: 'OnvifEvent'):
+        """Callback para eventos ONVIF recebidos - envia para a edge function"""
+        logger.info(f"🔔 _on_onvif_event chamado: {event.event_type} de {event.camera_ip}")
+        
+        if not self.is_logged_in():
+            logger.warning("⚠ Não logado, ignorando evento ONVIF")
+            return
+        
+        if not self.device_token:
+            logger.warning(f"⚠ Device token não disponível para enviar evento ONVIF (user_id: {self.user_id})")
+            return
+        
+        logger.info(f"📤 Enviando evento para edge function: {event.event_type}")
+        
+        try:
+            # Busca camera_id se disponível
+            camera_info = self._onvif_cameras.get(event.camera_ip, {})
+            camera_id = camera_info.get("camera_id")
+            
+            # Prepara o evento para a edge function
+            event_data = {
+                "event_type": event.event_type,
+                "camera_ip": event.camera_ip,
+                "camera_name": event.camera_name,
+                "severity": self._map_event_severity(event.event_type),
+                "message": f"{event.event_type} detectado em {event.camera_name}",
+                "metadata": {
+                    "topic": event.topic,
+                    "source": event.source,
+                    "data": event.data,
+                    "timestamp": event.timestamp.isoformat(),
+                },
+            }
+            
+            if camera_id:
+                event_data["camera_id"] = camera_id
+            
+            # Envia para a edge function com device_token
+            self._send_camera_event(event_data)
+            
+            logger.info(f"📤 Evento ONVIF enviado: {event.event_type} de {event.camera_name}")
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao enviar evento ONVIF: {e}")
+    
+    def _send_camera_event(self, event_data: Dict):
+        """Envia evento de câmera para a edge function usando device_token"""
+        url = f"{self.url}/functions/v1/receive-camera-event"
+        
+        headers = {
+            "apikey": self.anon_key,
+            "Content-Type": "application/json",
+            "x-device-token": self.device_token,
+        }
+        
+        body = json.dumps(event_data).encode('utf-8')
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        
+        try:
+            ctx = ssl.create_default_context()
+            logger.info(f"🌐 POST {url}")
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
+                response_text = response.read().decode('utf-8')
+                result = json.loads(response_text) if response_text else {}
+                logger.info(f"✅ Evento enviado com sucesso: {result}")
+                return result
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8')
+            logger.error(f"❌ Erro ao enviar evento: HTTP {e.code} - {error_body}")
+            raise
+        except Exception as e:
+            logger.error(f"❌ Erro ao enviar evento: {e}")
+            raise
+    
+    def _map_event_severity(self, event_type: str) -> str:
+        """Mapeia tipo de evento para severidade"""
+        critical_events = ['tampering', 'video_loss', 'alarm_input']
+        warning_events = ['intrusion_detection', 'line_crossing']
+        
+        if event_type in critical_events:
+            return 'critical'
+        elif event_type in warning_events:
+            return 'warning'
+        return 'info'
     
     def update_status(self, ffmpeg_installed: bool = None, active_streams: int = None):
         """Atualiza informações de status e envia heartbeat"""

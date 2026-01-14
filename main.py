@@ -1,6 +1,13 @@
 """
 IVMS Pro - Servidor de Streaming
-FastAPI server para receber RTMP e servir HLS
+FastAPI server para servir HLS
+
+Modos de operação:
+1. HLS Relay (preferencial): Apenas recebe e serve segmentos HLS do app local
+   - NÃO processa vídeo - apenas repassa os arquivos
+   - Menor carga no servidor, menor latência
+   
+2. RTMP Push (fallback): Recebe RTMP e converte para HLS via nginx-rtmp
 """
 
 import os
@@ -621,26 +628,44 @@ async def relay_register(request: Request):
 async def relay_upload(stream_key: str, filename: str, request: Request):
     """
     Recebe segmentos HLS do app local.
-    Endpoint otimizado para baixa latência.
+    
+    IMPORTANTE: Este endpoint NÃO processa vídeo!
+    - Apenas recebe arquivos .ts e .m3u8 já processados pelo app local
+    - Armazena os arquivos para serem servidos via /hls/{stream_key}.m3u8
+    - O processamento FFmpeg acontece no computador do usuário
+    
+    Otimizado para baixa latência com escrita atômica.
     """
     stream_dir = HLS_DIR / stream_key
     
-    # Criar diretório se não existir
+    # Criar diretório se não existir (auto-registro)
     if not stream_dir.exists():
         stream_dir.mkdir(parents=True, exist_ok=True)
         print(f"📁 Created relay directory: {stream_key}")
+        
+        # Auto-registrar stream se não existir
+        if stream_key not in stream_manager.streams:
+            stream_manager.streams[stream_key] = {
+                "name": stream_key,
+                "source_url": "hls-relay",
+                "status": "running",
+                "mode": "hls-relay",
+                "dir": str(stream_dir),
+                "start_time": __import__('time').time(),
+                "restart_count": 0,
+            }
     
     file_path = stream_dir / filename
     
     # Ler body da requisição
     content = await request.body()
     
-    # Escrever arquivo de forma atômica
+    # Escrever arquivo de forma atômica para evitar leituras parciais
     temp_path = file_path.with_suffix('.tmp')
     async with aiofiles.open(temp_path, 'wb') as f:
         await f.write(content)
     
-    # Renomear para nome final (atômico)
+    # Renomear para nome final (operação atômica no filesystem)
     temp_path.rename(file_path)
     
     # Atualizar status do stream

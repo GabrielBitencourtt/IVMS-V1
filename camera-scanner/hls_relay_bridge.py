@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-HLS Relay Bridge - Gera HLS localmente e envia para servidor Railway
+HLS Relay Bridge - Processa RTSP localmente e envia HLS para Railway
 
-Arquitetura:
-1. App local captura RTSP e gera segmentos HLS com FFmpeg
-2. Segmentos são enviados via HTTP POST para o servidor Railway
-3. Railway apenas serve os arquivos - sem processamento
+ARQUITETURA HLS RELAY:
+======================
+1. App LOCAL captura stream RTSP da câmera
+2. FFmpeg LOCAL converte para segmentos HLS (.ts + .m3u8)
+3. Segmentos são enviados via HTTP PUT para o servidor Railway
+4. Railway APENAS SERVE os arquivos - SEM PROCESSAMENTO DE VÍDEO
 
-Benefícios:
-- Menor latência (processamento local)
-- Menor carga no servidor Railway
-- Funciona com IPs privados sem port forwarding
+Fluxo: Câmera RTSP → FFmpeg Local → HTTP → Railway (proxy) → Browser HLS
+
+BENEFÍCIOS:
+- Menor latência (~1-2s vs ~4-6s)
+- Zero carga de CPU no servidor Railway  
+- Funciona com câmeras em rede privada
+- Sem necessidade de port forwarding
+
+CONFIGURAÇÃO:
+- RELAY_SERVER_URL: URL do servidor Railway (ex: https://ivms-streaming.up.railway.app)
 """
 
 import subprocess
@@ -193,10 +201,10 @@ class HLSRelayBridge:
     
     def _monitor_segments(self):
         """Monitora novos segmentos HLS e faz upload para o servidor"""
-        uploaded_segments: Dict[str, set] = {}  # stream_key -> set of uploaded segment names
+        uploaded_segments: Dict[str, set] = {}
         
         while self._running:
-            time.sleep(0.3)  # Checar a cada 300ms para baixa latência
+            time.sleep(0.5)  # Checar a cada 500ms (mais estável)
             
             for stream_key, stream in list(self.active_streams.items()):
                 if stream.status != "running":
@@ -343,49 +351,48 @@ class HLSRelayBridge:
         
         output_playlist = stream_dir / "index.m3u8"
         
-        # Comando FFmpeg ULTRA LOW LATENCY para HLS local
+        # Comando FFmpeg otimizado para REPRODUÇÃO SUAVE
+        # Prioriza estabilidade sobre latência mínima
         cmd = [
             self._ffmpeg_path,
             "-y",
             "-hide_banner",
             "-loglevel", "warning",
-            # Opções de baixa latência
-            "-fflags", "+genpts+discardcorrupt+nobuffer",
+            # Input options - buffer maior para estabilidade
+            "-fflags", "+genpts+discardcorrupt",
             "-flags", "low_delay",
-            "-strict", "experimental",
-            # Input RTSP
             "-rtsp_transport", "tcp",
             "-rtsp_flags", "prefer_tcp",
             "-timeout", "5000000",
-            "-buffer_size", "512000",
-            "-max_delay", "100000",
-            "-analyzeduration", "500000",
-            "-probesize", "500000",
+            "-buffer_size", "1024000",       # Buffer maior para estabilidade
+            "-max_delay", "500000",          # Mais delay permitido
+            "-analyzeduration", "1000000",   # Mais tempo para análise
+            "-probesize", "1000000",
             "-i", rtsp_url,
-            # Video encoding - ultra low latency
+            # Video encoding - SUAVIDADE > LATÊNCIA
             "-c:v", "libx264",
-            "-preset", "ultrafast",
+            "-preset", "veryfast",           # veryfast = melhor qualidade que ultrafast
             "-tune", "zerolatency",
-            "-profile:v", "baseline",
-            "-level", "3.1",
+            "-profile:v", "main",            # main profile = melhor compatibilidade
+            "-level", "4.0",
             "-pix_fmt", "yuv420p",
-            "-vf", "scale=854:-2",  # 480p
-            "-r", "25",
-            "-g", "12",  # GOP = 0.5s
-            "-keyint_min", "12",
-            "-sc_threshold", "0",
-            "-b:v", "800k",
-            "-maxrate", "900k",
-            "-bufsize", "400k",
-            "-an",  # Sem áudio
-            "-threads", "2",
-            # HLS output - segmentos pequenos
+            "-vf", "scale=1280:-2",          # 720p para melhor qualidade
+            "-r", "25",                      # FPS fixo
+            "-g", "50",                      # GOP = 2s (mais estável)
+            "-keyint_min", "25",             # Keyframe mínimo 1s
+            "-sc_threshold", "0",            # Desativar detecção de cena
+            "-b:v", "1500k",                 # Bitrate maior para qualidade
+            "-maxrate", "2000k",
+            "-bufsize", "3000k",             # Buffer maior = mais suave
+            "-an",                           # Sem áudio
+            "-threads", "0",                 # Auto threads
+            # HLS output - segmentos maiores para estabilidade
             "-f", "hls",
-            "-hls_time", "0.5",  # Segmentos de 0.5s
-            "-hls_list_size", "4",  # 4 segmentos = 2s buffer
-            "-hls_flags", "delete_segments+independent_segments+split_by_time",
+            "-hls_time", "1",                # Segmentos de 1s (mais estável)
+            "-hls_list_size", "5",           # 5 segmentos = 5s buffer
+            "-hls_flags", "delete_segments+independent_segments+append_list",
             "-hls_segment_type", "mpegts",
-            "-hls_segment_filename", str(stream_dir / "seg_%03d.ts"),
+            "-hls_segment_filename", str(stream_dir / "seg_%05d.ts"),
             str(output_playlist)
         ]
         
@@ -584,7 +591,7 @@ class HLSRelayBridge:
         return [self.get_stream_status(key) for key in self.active_streams]
     
     def shutdown(self):
-        """Encerra o bridge e todos os streams."""
+        """Encerra o bridge e todos os streams"""
         self._running = False
         self.stop_all_streams()
         self._upload_executor.shutdown(wait=False)

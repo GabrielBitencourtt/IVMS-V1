@@ -573,6 +573,123 @@ async def reset_stream(stream_key: str):
     return {"message": "Stream reset", "stream_key": stream_key, "status": "waiting"}
 
 
+# ============ HLS Relay Endpoints (para app local) ============
+
+@app.post("/relay/register")
+async def relay_register(request: Request):
+    """Registra um stream HLS Relay (app local envia segmentos)"""
+    try:
+        data = await request.json()
+        stream_key = data.get("stream_key", "")
+        name = data.get("name", "")
+        
+        if not stream_key:
+            raise HTTPException(status_code=400, detail="stream_key é obrigatório")
+        
+        print(f"📡 Relay stream registered: {stream_key}")
+        
+        # Criar diretório HLS
+        stream_dir = HLS_DIR / stream_key
+        stream_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Registrar stream
+        stream_manager.streams[stream_key] = {
+            "name": name or stream_key,
+            "source_url": "hls-relay",
+            "status": "running",
+            "mode": "hls-relay",
+            "dir": str(stream_dir),
+            "start_time": __import__('time').time(),
+            "restart_count": 0,
+        }
+        
+        base_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "localhost:8080")
+        protocol = "https" if "railway" in base_url else "http"
+        
+        return {
+            "success": True,
+            "stream_key": stream_key,
+            "hls_url": f"{protocol}://{base_url}/hls/{stream_key}.m3u8"
+        }
+        
+    except Exception as e:
+        print(f"❌ Error registering relay: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/relay/{stream_key}/{filename}")
+async def relay_upload(stream_key: str, filename: str, request: Request):
+    """
+    Recebe segmentos HLS do app local.
+    Endpoint otimizado para baixa latência.
+    """
+    stream_dir = HLS_DIR / stream_key
+    
+    # Criar diretório se não existir
+    if not stream_dir.exists():
+        stream_dir.mkdir(parents=True, exist_ok=True)
+        print(f"📁 Created relay directory: {stream_key}")
+    
+    file_path = stream_dir / filename
+    
+    # Ler body da requisição
+    content = await request.body()
+    
+    # Escrever arquivo de forma atômica
+    temp_path = file_path.with_suffix('.tmp')
+    async with aiofiles.open(temp_path, 'wb') as f:
+        await f.write(content)
+    
+    # Renomear para nome final (atômico)
+    temp_path.rename(file_path)
+    
+    # Atualizar status do stream
+    if stream_key in stream_manager.streams:
+        stream_manager.streams[stream_key]["status"] = "running"
+        stream_manager.streams[stream_key]["last_segment_time"] = __import__('time').time()
+    
+    return Response(status_code=200)
+
+
+@app.delete("/relay/{stream_key}")
+async def relay_unregister(stream_key: str):
+    """Remove registro de um stream HLS Relay"""
+    print(f"🗑️ Relay stream unregistered: {stream_key}")
+    
+    # Limpar diretório
+    stream_dir = HLS_DIR / stream_key
+    if stream_dir.exists():
+        import shutil
+        shutil.rmtree(stream_dir, ignore_errors=True)
+    
+    # Remover do registro
+    if stream_key in stream_manager.streams:
+        del stream_manager.streams[stream_key]
+    
+    return {"success": True, "stream_key": stream_key}
+
+
+@app.get("/relay/status")
+async def relay_status():
+    """Status de todos os streams HLS Relay"""
+    relay_streams = []
+    
+    for key, info in stream_manager.streams.items():
+        if info.get("mode") == "hls-relay":
+            stream_dir = HLS_DIR / key
+            segment_count = len(list(stream_dir.glob("*.ts"))) if stream_dir.exists() else 0
+            
+            relay_streams.append({
+                "stream_key": key,
+                "name": info.get("name"),
+                "status": info.get("status"),
+                "segment_count": segment_count,
+                "last_segment_time": info.get("last_segment_time")
+            })
+    
+    return {"relay_streams": relay_streams}
+
+
 # ============ Para desenvolvimento local ============
 
 if __name__ == "__main__":

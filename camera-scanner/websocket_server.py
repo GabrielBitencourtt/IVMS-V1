@@ -3,6 +3,10 @@
 WebSocket Server para comunicação com a plataforma web
 Integra o Scanner de Câmeras com o Bridge de Streaming
 Suporta Private Network Access (Chrome 94+)
+
+Modos de operação:
+1. HLS Relay (preferencial): Processa localmente e envia segmentos para Railway
+2. RTMP Bridge (fallback): Envia RTMP para servidor processar
 """
 
 import asyncio
@@ -11,6 +15,7 @@ import logging
 import socket
 import platform
 import uuid
+import os
 from typing import Set, Optional
 from datetime import datetime
 from http import HTTPStatus
@@ -25,6 +30,14 @@ except ImportError:
     WEBSOCKETS_VERSION = (0, 0)
     print("⚠ websockets não instalado. Execute: pip install websockets")
 
+# Tentar importar HLS Relay primeiro (preferencial)
+try:
+    from hls_relay_bridge import HLSRelayBridge
+    HLS_RELAY_AVAILABLE = True
+except ImportError:
+    HLS_RELAY_AVAILABLE = False
+
+# Fallback para RTMP Bridge
 from stream_bridge import StreamBridge
 
 logger = logging.getLogger(__name__)
@@ -98,23 +111,36 @@ class BridgeWebSocketServer:
     """
     Servidor WebSocket que permite a plataforma web controlar:
     - Descoberta de câmeras na rede
-    - Streaming de câmeras locais via bridge
+    - Streaming de câmeras locais via HLS Relay (preferencial) ou RTMP Bridge
     - Instalação automática do FFmpeg
+    
+    Modos de streaming:
+    - hls-relay: Processa localmente, envia segmentos HLS para Railway (menor latência)
+    - rtmp-bridge: Envia RTMP para servidor Railway processar (fallback)
     """
     
     def __init__(self, 
-                 host: str = "0.0.0.0",  # Aceita conexões de localhost e 127.0.0.1
+                 host: str = "0.0.0.0",
                  port: int = 8765,
-                 rtmp_server_url: str = "rtmp://hopper.proxy.rlwy.net:46960/live"):
+                 rtmp_server_url: str = "rtmp://hopper.proxy.rlwy.net:46960/live",
+                 relay_server_url: str = None):
         self.host = host
         self.port = port
         self.rtmp_server_url = rtmp_server_url
+        
+        # URL do servidor de relay (Railway HTTP)
+        self.relay_server_url = relay_server_url or os.getenv(
+            "RELAY_SERVER_URL", 
+            "https://ivms-streaming.up.railway.app"
+        )
+        
         self.clients: Set = set()
-        self.bridge: Optional[StreamBridge] = None
+        self.bridge = None  # StreamBridge ou HLSRelayBridge
+        self.bridge_mode = "unknown"  # "hls-relay" ou "rtmp-bridge"
         self.server = None
         self._running = False
         self._ffmpeg_installing = False
-        self.client_id = str(uuid.uuid4())[:8]  # Unique client ID
+        self.client_id = str(uuid.uuid4())[:8]
         self.hostname = platform.node()
         self.os_info = f"{platform.system()} {platform.release()}"
         
@@ -220,6 +246,8 @@ class BridgeWebSocketServer:
                     "ffmpeg_available": ffmpeg_available,
                     "ffmpeg_installing": self._ffmpeg_installing,
                     "active_streams": len(self.bridge.active_streams) if self.bridge else 0,
+                    "bridge_mode": self.bridge_mode,  # "hls-relay" ou "rtmp-bridge"
+                    "relay_server_url": self.relay_server_url if self.bridge_mode == "hls-relay" else None,
                     "timestamp": datetime.now().isoformat()
                 }
             }))
@@ -250,6 +278,8 @@ class BridgeWebSocketServer:
                         "local_ip": self.get_local_ip(),
                         "ffmpeg_available": self.bridge.is_ffmpeg_available() if self.bridge else False,
                         "active_streams": len(self.bridge.active_streams) if self.bridge else 0,
+                        "bridge_mode": self.bridge_mode,
+                        "relay_server_url": self.relay_server_url if self.bridge_mode == "hls-relay" else None,
                         "timestamp": datetime.now().isoformat()
                     }
                 }))
@@ -405,9 +435,8 @@ class BridgeWebSocketServer:
         # Sinaliza que pode estar instalando FFmpeg
         self._ffmpeg_installing = True
         
-        # Inicializa o bridge de streaming (isso pode instalar FFmpeg automaticamente)
+        # Callback para progresso do FFmpeg
         def ffmpeg_progress_sync(msg, pct):
-            # Chamado da thread do instalador, precisa agendar no event loop
             try:
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
@@ -421,11 +450,31 @@ class BridgeWebSocketServer:
             except:
                 pass
         
-        self.bridge = StreamBridge(
-            rtmp_server_url=self.rtmp_server_url,
-            on_status_change=self.on_stream_status_change,
-            on_ffmpeg_progress=ffmpeg_progress_sync
-        )
+        # Tentar usar HLS Relay primeiro (menor latência)
+        if HLS_RELAY_AVAILABLE:
+            try:
+                logger.info(f"🚀 Inicializando HLS Relay (servidor: {self.relay_server_url})")
+                self.bridge = HLSRelayBridge(
+                    relay_server_url=self.relay_server_url,
+                    on_status_change=self.on_stream_status_change,
+                    on_ffmpeg_progress=ffmpeg_progress_sync
+                )
+                self.bridge_mode = "hls-relay"
+                logger.info("✓ HLS Relay Bridge inicializado")
+            except Exception as e:
+                logger.warning(f"⚠ Falha ao inicializar HLS Relay: {e}")
+                self.bridge = None
+        
+        # Fallback para RTMP Bridge
+        if self.bridge is None:
+            logger.info(f"📡 Inicializando RTMP Bridge (servidor: {self.rtmp_server_url})")
+            self.bridge = StreamBridge(
+                rtmp_server_url=self.rtmp_server_url,
+                on_status_change=self.on_stream_status_change,
+                on_ffmpeg_progress=ffmpeg_progress_sync
+            )
+            self.bridge_mode = "rtmp-bridge"
+            logger.info("✓ RTMP Bridge inicializado")
         
         self._ffmpeg_installing = False
         self._running = True

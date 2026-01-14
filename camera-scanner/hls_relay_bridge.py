@@ -584,7 +584,7 @@ class HLSRelayBridge:
         return [self.get_stream_status(key) for key in self.active_streams]
     
     def shutdown(self):
-        """Encerra o bridge e todos os streams"""
+        """Encerra o bridge e todos os streams."""
         self._running = False
         self.stop_all_streams()
         self._upload_executor.shutdown(wait=False)

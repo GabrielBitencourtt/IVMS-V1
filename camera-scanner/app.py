@@ -40,6 +40,15 @@ try:
 except ImportError:
     print("⚠ ONVIF Events não disponível (onvif_events.py não encontrado)")
 
+# WebSocket Producer support
+WEBSOCKET_PRODUCER_AVAILABLE = False
+try:
+    from websocket_producer import WebSocketProducer
+    WEBSOCKET_PRODUCER_AVAILABLE = True
+    print("✓ WebSocket Producer disponível")
+except ImportError:
+    print("⚠ WebSocket Producer não disponível (websocket_producer.py não encontrado)")
+
 # Configuração
 SUPABASE_URL = "https://cedkflgtubaologqjker.supabase.co"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNlZGtmbGd0dWJhb2xvZ3Fqa2VyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjgxNDgyMTksImV4cCI6MjA4MzcyNDIxOX0.VnJBlll6_aiSTzNg92zamW2d-V523yZW7oM28sQlL-E"
@@ -456,6 +465,40 @@ class SupabaseClient:
         # ONVIF Events Manager
         self._onvif_manager: Optional['OnvifEventsManager'] = None
         self._onvif_cameras: Dict[str, Dict] = {}  # IP -> {username, password, name, camera_id}
+        
+        # WebSocket Producer para streaming de baixa latência
+        # Será inicializado após verificação do FFmpeg
+        self._ws_producer: Optional['WebSocketProducer'] = None
+        self._websocket_server_url = "wss://ivms-v1-production.up.railway.app"
+    
+    def _init_websocket_producer(self):
+        """Inicializa WebSocket Producer após FFmpeg estar disponível"""
+        if not WEBSOCKET_PRODUCER_AVAILABLE:
+            logger.info("⚡ WebSocket Producer: ✗ (não disponível)")
+            return
+        
+        if not self.ffmpeg_installed or not self.ffmpeg_path:
+            logger.warning("⚡ WebSocket Producer: ✗ (FFmpeg não disponível)")
+            return
+        
+        try:
+            self._ws_producer = WebSocketProducer(
+                server_url=self._websocket_server_url,
+                on_status_change=self._on_ws_status_change,
+                ffmpeg_path=self.ffmpeg_path
+            )
+            if self._ws_producer.is_available():
+                logger.info(f"⚡ WebSocket Producer: ✓ (server: {self._websocket_server_url}, ffmpeg: {self.ffmpeg_path})")
+            else:
+                logger.warning("⚡ WebSocket Producer: ✗ (FFmpeg não detectado pelo producer)")
+                self._ws_producer = None
+        except Exception as e:
+            logger.error(f"❌ Falha ao criar WebSocket Producer: {e}")
+            self._ws_producer = None
+    
+    def _on_ws_status_change(self, stream_key: str, status: str, error: str):
+        """Callback quando status de um stream WebSocket muda"""
+        logger.info(f"[WS] Stream {stream_key}: {status}" + (f" - {error}" if error else ""))
     
     def check_and_install_ffmpeg(self, progress_callback: Optional[Callable] = None) -> bool:
         """Verifica e instala FFmpeg se necessário, com callbacks de progresso"""
@@ -477,6 +520,7 @@ class SupabaseClient:
             report(f"FFmpeg encontrado: {ffmpeg_path}", 100, "success")
             self.ffmpeg_installed = True
             self.ffmpeg_path = ffmpeg_path
+            self._init_websocket_producer()
             return True
         
         report("Verificando caminhos comuns...", 20, "checking")
@@ -489,16 +533,19 @@ class SupabaseClient:
             "/usr/bin/ffmpeg",
             "/usr/local/bin/ffmpeg",
             "/opt/homebrew/bin/ffmpeg",
+            # Adiciona caminho local do CameraScanner
+            os.path.join(os.environ.get('LOCALAPPDATA', ''), 'CameraScanner', 'ffmpeg', 'bin', 'ffmpeg.exe'),
         ]
         
         for path in common_paths:
-            if os.path.isfile(path):
+            if path and os.path.isfile(path):
                 try:
                     result = subprocess.run([path, "-version"], capture_output=True, timeout=5)
                     if result.returncode == 0:
                         report(f"FFmpeg encontrado: {path}", 100, "success")
                         self.ffmpeg_installed = True
                         self.ffmpeg_path = path
+                        self._init_websocket_producer()
                         return True
                 except:
                     pass
@@ -522,6 +569,8 @@ class SupabaseClient:
                 report(f"FFmpeg disponível: {version}", 100, "success")
                 self.ffmpeg_installed = True
                 self.ffmpeg_path = path
+                # Inicializa WebSocket Producer agora que FFmpeg está disponível
+                self._init_websocket_producer()
                 return True
             
             # Se não está disponível, instala
@@ -530,6 +579,8 @@ class SupabaseClient:
                 report(f"FFmpeg instalado com sucesso!", 100, "success")
                 self.ffmpeg_installed = True
                 self.ffmpeg_path = path
+                # Inicializa WebSocket Producer agora que FFmpeg está disponível
+                self._init_websocket_producer()
                 return True
             else:
                 report("Falha na instalação do FFmpeg", 100, "error")
@@ -829,10 +880,11 @@ class SupabaseClient:
             }
     
     def _handle_start_stream_command(self, payload: Dict) -> Dict:
-        """Processa comando de iniciar stream RTSP → RTMP"""
+        """Processa comando de iniciar stream RTSP → WebSocket ou RTMP"""
         stream_key = payload.get("stream_key")
         rtsp_url = payload.get("rtsp_url")
         camera_name = payload.get("camera_name", "")
+        stream_mode = payload.get("stream_mode", "auto")  # "auto", "websocket", "rtmp"
         
         if not stream_key or not rtsp_url:
             return {"success": False, "error": "stream_key e rtsp_url são obrigatórios"}
@@ -840,13 +892,48 @@ class SupabaseClient:
         if not self.ffmpeg_installed or not self.ffmpeg_path:
             return {"success": False, "error": "FFmpeg não disponível"}
         
-        # Verifica se stream já existe
+        # Verifica se stream já existe (RTMP)
         if hasattr(self, '_stream_processes') and stream_key in self._stream_processes:
             process = self._stream_processes[stream_key]
             if process.poll() is None:  # Processo ainda rodando
-                logger.info(f"⚠️ Stream {stream_key} já está rodando")
-                return {"success": True, "stream_key": stream_key, "already_running": True}
+                logger.info(f"⚠️ Stream RTMP {stream_key} já está rodando")
+                return {"success": True, "stream_key": stream_key, "already_running": True, "mode": "rtmp"}
         
+        # Verifica se stream já existe (WebSocket)
+        if self._ws_producer and self._ws_producer.get_stream_status(stream_key):
+            logger.info(f"⚠️ Stream WebSocket {stream_key} já está rodando")
+            return {"success": True, "stream_key": stream_key, "already_running": True, "mode": "websocket"}
+        
+        # ========== Modo WebSocket (baixa latência) ==========
+        use_websocket = False
+        if stream_mode == "websocket" and self._ws_producer:
+            use_websocket = True
+        elif stream_mode == "auto" and self._ws_producer:
+            # Auto: usa WebSocket se disponível
+            use_websocket = True
+        
+        if use_websocket:
+            logger.info(f"⚡ Iniciando stream WebSocket: {stream_key}")
+            logger.info(f"   RTSP: {rtsp_url}")
+            logger.info(f"   WS Server: {self._websocket_server_url}")
+            
+            result = self._ws_producer.start_stream(stream_key, rtsp_url, camera_name)
+            
+            if result.get("success"):
+                logger.info(f"✅ Stream WebSocket {stream_key} iniciado!")
+                return {
+                    "success": True,
+                    "stream_key": stream_key,
+                    "mode": "websocket",
+                    "ws_url": result.get("ws_url"),
+                    "hls_url": f"{self.streaming_server_url}/hls/{stream_key}.m3u8",  # Fallback HLS
+                }
+            else:
+                # Fallback para RTMP se WebSocket falhar
+                logger.warning(f"⚠️ WebSocket falhou ({result.get('error')}), tentando RTMP...")
+                use_websocket = False
+        
+        # ========== Modo RTMP (tradicional com HLS) ==========
         # URL do servidor RTMP (Railway) - usa a config do agente
         rtmp_url = self.rtmp_ingest_url
         rtmp_output = f"{rtmp_url}/{stream_key}"
@@ -854,7 +941,7 @@ class SupabaseClient:
         # URL do servidor HLS
         hls_url = f"{self.streaming_server_url}/hls/{stream_key}.m3u8"
         
-        logger.info(f"🎬 Iniciando stream: {stream_key}")
+        logger.info(f"🎬 Iniciando stream RTMP: {stream_key}")
         logger.info(f"   RTSP: {rtsp_url}")
         logger.info(f"   RTMP: {rtmp_output}")
         
@@ -956,39 +1043,52 @@ class SupabaseClient:
             return {"success": False, "error": str(e), "stream_key": stream_key}
     
     def _handle_stop_stream_command(self, payload: Dict) -> Dict:
-        """Processa comando de parar stream"""
+        """Processa comando de parar stream (WebSocket ou RTMP)"""
         stream_key = payload.get("stream_key")
         
         if not stream_key:
             return {"success": False, "error": "stream_key é obrigatório"}
         
+        stopped_any = False
+        
+        # Tentar parar stream WebSocket
+        if self._ws_producer:
+            ws_status = self._ws_producer.get_stream_status(stream_key)
+            if ws_status:
+                result = self._ws_producer.stop_stream(stream_key)
+                if result.get("success"):
+                    logger.info(f"🛑 Stream WebSocket {stream_key} parado")
+                    stopped_any = True
+        
+        # Tentar parar stream RTMP
         if not hasattr(self, '_stream_processes'):
             self._stream_processes = {}
         
-        if stream_key not in self._stream_processes:
-            return {"success": False, "error": "Stream não encontrado"}
-        
-        try:
-            process = self._stream_processes[stream_key]
-            
-            # Envia SIGTERM
-            process.terminate()
-            
+        if stream_key in self._stream_processes:
             try:
-                process.wait(timeout=5)
-            except:
-                process.kill()
-            
-            del self._stream_processes[stream_key]
-            self.active_streams = len(self._stream_processes)
-            
-            logger.info(f"🛑 Stream {stream_key} parado")
-            
+                process = self._stream_processes[stream_key]
+                
+                # Envia SIGTERM
+                process.terminate()
+                
+                try:
+                    process.wait(timeout=5)
+                except:
+                    process.kill()
+                
+                del self._stream_processes[stream_key]
+                self.active_streams = len(self._stream_processes)
+                
+                logger.info(f"🛑 Stream RTMP {stream_key} parado")
+                stopped_any = True
+                
+            except Exception as e:
+                logger.error(f"Erro ao parar stream RTMP: {e}")
+        
+        if stopped_any:
             return {"success": True, "stream_key": stream_key}
-            
-        except Exception as e:
-            logger.error(f"Erro ao parar stream: {e}")
-            return {"success": False, "error": str(e)}
+        else:
+            return {"success": False, "error": "Stream não encontrado"}
     
     def _parse_ffmpeg_error(self, stderr: str) -> str:
         """Extrai mensagem de erro amigável do stderr do FFmpeg"""

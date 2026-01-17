@@ -3,9 +3,10 @@
 IVMS Cloud Agent - Agente local que conecta ao backend cloud
 Este agente roda na rede do cliente e se comunica com o cloud via HTTPS/WSS
 Inclui suporte a eventos ONVIF para Motion Detection, Analytics, etc.
+Suporta streaming via WebSocket (baixa latência ~1-2s)
 """
 
-AGENT_VERSION = "1.6.0"  # Versão com auto-start ONVIF no login
+AGENT_VERSION = "2.0.0"  # Versão WebSocket-only (removido HLS/RTMP)
 
 import os
 import sys
@@ -53,6 +54,15 @@ try:
 except ImportError:
     logger.warning("⚠️ ONVIF Events não disponível (onvif_events.py não encontrado)")
 
+# Tenta importar WebSocket Producer
+WEBSOCKET_AVAILABLE = False
+try:
+    from websocket_producer import WebSocketProducer
+    WEBSOCKET_AVAILABLE = True
+    logger.info("⚡ WebSocket streaming disponível")
+except ImportError:
+    logger.warning("⚠️ WebSocket streaming não disponível (websocket_producer.py não encontrado)")
+
 
 class StreamProcess:
     """Representa um processo de streaming ativo"""
@@ -83,12 +93,16 @@ class CloudAgent:
         rtmp_url: str = "rtmp://localhost/live",
         heartbeat_interval: int = 10,  # Reduced from 30s for faster command processing
         enable_onvif_events: bool = True,
+        enable_websocket: bool = True,  # Habilitar streaming WebSocket
+        websocket_server_url: str = "",  # URL do servidor WebSocket (Railway)
     ):
         self.cloud_url = cloud_url.rstrip('/')
         self.device_token = device_token
         self.rtmp_url = rtmp_url
         self.heartbeat_interval = heartbeat_interval
         self.enable_onvif_events = enable_onvif_events and ONVIF_AVAILABLE
+        self.enable_websocket = enable_websocket and WEBSOCKET_AVAILABLE
+        self.websocket_server_url = websocket_server_url
         
         # Estado
         self.agent_id: Optional[str] = None
@@ -98,9 +112,26 @@ class CloudAgent:
         self.supabase_url: Optional[str] = None
         self.supabase_key: Optional[str] = None
         
-        # Streams ativos
+        # Streams ativos (RTMP)
         self.streams: Dict[str, StreamProcess] = {}
         self.streams_lock = threading.Lock()
+        
+        # WebSocket Producer para streaming de baixa latência
+        self.ws_producer: Optional[WebSocketProducer] = None
+        logger.info(f"⚡ WebSocket config: enable={self.enable_websocket}, url={websocket_server_url}")
+        if self.enable_websocket and websocket_server_url:
+            try:
+                self.ws_producer = WebSocketProducer(
+                    server_url=websocket_server_url,
+                    on_status_change=self._on_ws_status_change
+                )
+                logger.info(f"⚡ WebSocket Producer: ✓ (server: {websocket_server_url})")
+            except Exception as e:
+                logger.error(f"❌ Falha ao criar WebSocket Producer: {e}")
+                self.ws_producer = None
+        else:
+            logger.info(f"⚡ WebSocket Producer: ✗ (desabilitado)")
+        
         
         # ONVIF Events Manager
         self.onvif_manager: Optional[OnvifEventsManager] = None
@@ -132,6 +163,11 @@ class CloudAgent:
         logger.info(f"💻 Sistema: {self.os_info}")
         logger.info(f"🎬 FFmpeg: {'✓ Disponível' if self.ffmpeg_available else '✗ Não encontrado'}")
         logger.info(f"📡 ONVIF Events: {'✓ Habilitado' if self.enable_onvif_events else '✗ Desabilitado'}")
+        logger.info(f"⚡ WebSocket: {'✓ Habilitado' if self.ws_producer else '✗ Desabilitado'}")
+    
+    def _on_ws_status_change(self, stream_key: str, status: str, error: str):
+        """Callback quando status de um stream WebSocket muda"""
+        logger.info(f"[WS] Stream {stream_key}: {status}" + (f" - {error}" if error else ""))
     
     def _find_ffmpeg(self) -> Optional[str]:
         """Encontra o executável do FFmpeg"""
@@ -369,7 +405,7 @@ class CloudAgent:
             self.send_command_result(cmd_id, "failed", error_message=str(e))
     
     def _handle_start_stream(self, payload: Dict) -> Dict:
-        """Inicia um stream RTSP → RTMP e opcionalmente escuta eventos ONVIF"""
+        """Inicia um stream RTSP → WebSocket e opcionalmente escuta eventos ONVIF"""
         stream_key = payload.get("stream_key")
         rtsp_url = payload.get("rtsp_url")
         camera_name = payload.get("camera_name", "")
@@ -384,14 +420,6 @@ class CloudAgent:
         if not self.ffmpeg_available:
             return {"success": False, "error": "FFmpeg não disponível"}
         
-        with self.streams_lock:
-            if stream_key in self.streams:
-                return {"success": False, "error": "Stream já existe"}
-            
-            stream = StreamProcess(stream_key, rtsp_url, camera_name)
-            stream.status = "starting"
-            self.streams[stream_key] = stream
-        
         # Extrai IP da câmera da URL RTSP
         camera_ip = self._extract_ip_from_rtsp(rtsp_url)
         
@@ -402,87 +430,66 @@ class CloudAgent:
                 onvif_username = parsed_creds.get("username", onvif_username)
                 onvif_password = parsed_creds.get("password", "")
         
-        # Inicia FFmpeg em thread separada
-        def start_ffmpeg():
-            rtmp_output = f"{self.rtmp_url}/{stream_key}"
-            
-            cmd = [
-                self.ffmpeg_path,
-                "-rtsp_transport", "tcp",
-                "-i", rtsp_url,
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-f", "flv",
-                "-flvflags", "no_duration_filesize",
-                rtmp_output,
-            ]
-            
-            try:
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+        # Câmeras locais usam APENAS WebSocket (menor latência)
+        if not self.ws_producer:
+            return {"success": False, "error": "WebSocket Producer não disponível. Verifique a configuração."}
+        
+        logger.info(f"⚡ Iniciando stream WebSocket: {stream_key}")
+        
+        # Verifica se já existe
+        if self.ws_producer.get_stream_status(stream_key):
+            return {"success": False, "error": "Stream já existe"}
+        
+        result = self.ws_producer.start_stream(stream_key, rtsp_url, camera_name)
+        
+        if result.get("success"):
+            # Inicia escuta de eventos ONVIF se habilitado
+            if enable_events and self.enable_onvif_events and camera_ip:
+                self._start_onvif_events(
+                    camera_ip=camera_ip,
+                    camera_name=camera_name or stream_key,
+                    username=onvif_username,
+                    password=onvif_password,
+                    port=onvif_port,
                 )
-                
-                with self.streams_lock:
-                    if stream_key in self.streams:
-                        self.streams[stream_key].process = process
-                        self.streams[stream_key].status = "running"
-                        self.streams[stream_key].started_at = datetime.now()
-                
-                logger.info(f"✅ Stream {stream_key} iniciado")
-                
-                # Inicia escuta de eventos ONVIF se habilitado
-                if enable_events and self.enable_onvif_events and camera_ip:
-                    self._start_onvif_events(
-                        camera_ip=camera_ip,
-                        camera_name=camera_name or stream_key,
-                        username=onvif_username,
-                        password=onvif_password,
-                        port=onvif_port,
-                    )
-                
-            except Exception as e:
-                logger.error(f"❌ Erro ao iniciar stream: {e}")
-                with self.streams_lock:
-                    if stream_key in self.streams:
-                        self.streams[stream_key].status = "error"
-                        self.streams[stream_key].error = str(e)
-        
-        threading.Thread(target=start_ffmpeg, daemon=True).start()
-        
-        return {"success": True, "stream_key": stream_key, "onvif_events": enable_events and self.enable_onvif_events}
+            
+            return {
+                "success": True,
+                "stream_key": stream_key,
+                "mode": "websocket",
+                "ws_url": result.get("ws_url"),
+                "onvif_events": enable_events and self.enable_onvif_events,
+            }
+        else:
+            return {"success": False, "error": result.get("error", "Falha ao iniciar WebSocket stream")}
     
     def _handle_stop_stream(self, payload: Dict) -> Dict:
-        """Para um stream ativo e a escuta de eventos ONVIF"""
+        """Para um stream WebSocket ativo e a escuta de eventos ONVIF"""
         stream_key = payload.get("stream_key")
+        camera_ip = payload.get("camera_ip")  # Opcional: IP para parar ONVIF
         
         if not stream_key:
             return {"success": False, "error": "stream_key é obrigatório"}
         
-        with self.streams_lock:
-            if stream_key not in self.streams:
-                return {"success": False, "error": "Stream não encontrado"}
-            
-            stream = self.streams[stream_key]
-            
-            # Para escuta ONVIF se ativa
-            camera_ip = self._extract_ip_from_rtsp(stream.rtsp_url)
-            if camera_ip and self.onvif_manager:
-                self._stop_onvif_events(camera_ip)
-            
-            # Para o processo FFmpeg
-            if stream.process:
-                stream.process.terminate()
-                try:
-                    stream.process.wait(timeout=5)
-                except:
-                    stream.process.kill()
-            
-            del self.streams[stream_key]
+        # Para stream WebSocket
+        if not self.ws_producer:
+            return {"success": False, "error": "WebSocket Producer não disponível"}
         
-        logger.info(f"🛑 Stream {stream_key} parado")
-        return {"success": True, "stream_key": stream_key}
+        ws_status = self.ws_producer.get_stream_status(stream_key)
+        if not ws_status:
+            return {"success": False, "error": "Stream não encontrado"}
+        
+        result = self.ws_producer.stop_stream(stream_key)
+        if not result.get("success"):
+            return {"success": False, "error": result.get("error", "Falha ao parar stream")}
+        
+        logger.info(f"🛑 Stream WebSocket {stream_key} parado")
+        
+        # Para escuta ONVIF se ativa
+        if camera_ip and self.onvif_manager:
+            self._stop_onvif_events(camera_ip)
+        
+        return {"success": True, "stream_key": stream_key, "mode": "websocket"}
     
     def _handle_test_rtsp(self, payload: Dict) -> Dict:
         """Testa conexão RTSP usando socket direto com suporte a Digest Auth"""
@@ -536,26 +543,49 @@ class CloudAgent:
         }
     
     def _handle_get_status(self) -> Dict:
-        """Retorna status atual do agente"""
+        """Retorna status atual do agente incluindo streams WebSocket e RTMP"""
+        # Streams RTMP
         with self.streams_lock:
-            streams_info = [
+            rtmp_streams = [
                 {
                     "stream_key": s.stream_key,
                     "camera_name": s.camera_name,
                     "status": s.status,
                     "started_at": s.started_at.isoformat() if s.started_at else None,
                     "error": s.error,
+                    "mode": "rtmp",
                 }
                 for s in self.streams.values()
             ]
+        
+        # Streams WebSocket
+        ws_streams = []
+        if self.ws_producer:
+            ws_streams = [
+                {
+                    "stream_key": s["stream_key"],
+                    "camera_name": s.get("camera_name", ""),
+                    "status": s["status"],
+                    "started_at": s.get("started_at"),
+                    "bytes_sent": s.get("bytes_sent", 0),
+                    "mode": "websocket",
+                }
+                for s in self.ws_producer.get_all_streams()
+            ]
+        
+        all_streams = rtmp_streams + ws_streams
         
         return {
             "hostname": self.hostname,
             "local_ip": self.local_ip,
             "os_info": self.os_info,
             "ffmpeg_available": self.ffmpeg_available,
-            "active_streams": len([s for s in streams_info if s["status"] == "running"]),
-            "streams": streams_info,
+            "websocket_available": self.ws_producer is not None,
+            "websocket_server": self.websocket_server_url if self.ws_producer else None,
+            "active_streams": len([s for s in all_streams if s["status"] == "running"]),
+            "rtmp_streams": len(rtmp_streams),
+            "ws_streams": len(ws_streams),
+            "streams": all_streams,
         }
     
     def _handle_test_onvif(self, payload: Dict) -> Dict:
@@ -1153,7 +1183,12 @@ class CloudAgent:
             self.onvif_manager.stop_all()
             logger.info("📡 ONVIF Events parado")
         
-        # Para todos os streams
+        # Para todos os streams WebSocket
+        if self.ws_producer:
+            self.ws_producer.stop_all()
+            logger.info("⚡ WebSocket streams parados")
+        
+        # Para todos os streams RTMP
         with self.streams_lock:
             for stream_key in list(self.streams.keys()):
                 self._handle_stop_stream({"stream_key": stream_key})
@@ -1202,10 +1237,20 @@ def main():
         help="URL do servidor RTMP"
     )
     parser.add_argument(
+        "--websocket-url",
+        default=os.environ.get("WEBSOCKET_URL", "wss://ivms-v1-production.up.railway.app"),
+        help="URL do servidor WebSocket para streaming de baixa latência"
+    )
+    parser.add_argument(
         "--heartbeat",
         type=int,
         default=30,
         help="Intervalo de heartbeat em segundos"
+    )
+    parser.add_argument(
+        "--no-websocket",
+        action="store_true",
+        help="Desabilita streaming via WebSocket (usa apenas RTMP)"
     )
     
     args = parser.parse_args()
@@ -1221,6 +1266,8 @@ def main():
         device_token=args.device_token,
         rtmp_url=args.rtmp_url,
         heartbeat_interval=args.heartbeat,
+        enable_websocket=not args.no_websocket,
+        websocket_server_url=args.websocket_url,
     )
     
     agent.run_forever()

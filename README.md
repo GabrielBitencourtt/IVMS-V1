@@ -75,3 +75,7 @@ Para adicionar processamento com Python (detecção de movimento, IA, etc), voc�
 - Firewall limitando IPs
 - SSL/TLS para HTTPS
 - Autenticação para publish
+
+## variavel railway
+
+ALLOWED_ORIGINS = https://cedkflgtubaologqjker.lovableproject.com,https://id--cedkflgtubaologqjker.lovable.app

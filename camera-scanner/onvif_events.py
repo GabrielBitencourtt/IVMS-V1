@@ -132,6 +132,8 @@ class OnvifEventsClient:
     - Video Analytics
     - Tampering
     - Video Source events
+    
+    Mantém uma única conexão persistente durante a vida do cliente.
     """
     
     def __init__(
@@ -163,10 +165,20 @@ class OnvifEventsClient:
         
         # Método de autenticação que funcionou (None = ainda não testado)
         self._working_auth_method: Optional[str] = None
+        # Formato de pull que funcionou
+        self._working_pull_format: Optional[int] = None
         
         # Cache de eventos para detectar duplicados
         self._last_events: Dict[str, datetime] = {}
         self._event_cooldown = 2.0  # segundos entre eventos iguais
+        
+        # Timestamp da última renovação de subscription
+        self._subscription_created_at: Optional[datetime] = None
+        self._subscription_ttl_seconds = 540  # Renovar antes de expirar (600s - 60s margem)
+        
+        # Flag para evitar logs repetitivos
+        self._connection_logged = False
+        self._poll_error_count = 0
     
     def _send_soap_request(self, url: str, action: str, body: str, debug: bool = False, try_all_auth: bool = False) -> Optional[str]:
         """Envia requisição SOAP para a câmera
@@ -209,12 +221,13 @@ class OnvifEventsClient:
             # Se já sabemos qual funciona, usa apenas esse
             auth_methods = [self._working_auth_method]
         else:
-            # Padrão: tenta WSSE digest primeiro
-            auth_methods = ['wsse_digest']
+            # Padrão: tenta HTTP digest primeiro (mais comum)
+            auth_methods = ['http_digest', 'wsse_digest']
         
         for auth_method in auth_methods:
             try:
-                if debug or try_all_auth:
+                # Log apenas se estiver explorando métodos (não em polling normal)
+                if try_all_auth and not self._working_auth_method:
                     logger.info(f"🔐 Tentando autenticação: {auth_method}")
                 
                 if auth_method == 'http_digest':
@@ -527,53 +540,47 @@ class OnvifEventsClient:
         if not self.subscription_reference:
             return []
         
-        # Formatos de PullMessages para diferentes fabricantes
-        bodies = [
-            # Formato padrão ONVIF
-            '''<tev:PullMessages>
-                <tev:Timeout>PT5S</tev:Timeout>
-                <tev:MessageLimit>100</tev:MessageLimit>
-            </tev:PullMessages>''',
-            # Formato Dahua/Intelbras - namespace explícito
-            '''<PullMessages xmlns="http://www.onvif.org/ver10/events/wsdl">
-                <Timeout>PT5S</Timeout>
-                <MessageLimit>100</MessageLimit>
-            </PullMessages>''',
-            # Formato alternativo com prefixo wsnt
-            '''<wsnt:PullMessages xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
-                <wsnt:Timeout>PT5S</wsnt:Timeout>
-                <wsnt:MessageLimit>100</wsnt:MessageLimit>
-            </wsnt:PullMessages>''',
-        ]
+        # Se já sabemos qual formato funciona, usa só ele
+        if hasattr(self, '_working_pull_format') and self._working_pull_format is not None:
+            bodies = [self._get_pull_body(self._working_pull_format)]
+        else:
+            # Tenta diferentes formatos
+            bodies = [
+                self._get_pull_body(0),
+                self._get_pull_body(1),
+                self._get_pull_body(2),
+            ]
         
         # Usa o subscription_reference como URL
         url = self.subscription_reference
         if not url.startswith('http'):
             url = f"{self.base_url}{url}"
         
-        # Log da URL para debug
-        logger.debug(f"📡 PullMessages URL: {url}")
+        response = None
         
         # Tenta cada formato de body
         for i, body in enumerate(bodies):
-            response = self._send_soap_request(
+            # Só tenta múltiplos auth se ainda não sabemos qual funciona
+            should_try_all = (i == 0 and not self._working_auth_method)
+            
+            resp = self._send_soap_request(
                 url,
                 'http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessagesRequest',
                 body,
-                try_all_auth=(i == 0)  # Só tenta todos os auth no primeiro formato
+                try_all_auth=should_try_all
             )
             
-            if response:
+            if resp:
                 # Verifica se não é um Fault
-                if '<Fault' not in response and 'Fault>' not in response:
-                    # Log apenas na primeira vez que um formato funciona
-                    if not hasattr(self, '_working_pull_format'):
-                        logger.info(f"✅ Formato PullMessages {i+1} funcionou")
-                        self._working_pull_format = i
+                if '<Fault' not in resp and 'Fault>' not in resp:
+                    # Cacheia o formato que funcionou
+                    if not hasattr(self, '_working_pull_format') or self._working_pull_format is None:
+                        # Calcula o índice real baseado no body
+                        real_idx = 0 if 'tev:PullMessages' in body else (1 if 'xmlns=' in body else 2)
+                        logger.info(f"✅ Formato PullMessages {real_idx+1} funcionou")
+                        self._working_pull_format = real_idx
+                    response = resp
                     break
-        else:
-            # Nenhum formato funcionou sem Fault
-            response = None
         
         events = []
         
@@ -614,7 +621,7 @@ class OnvifEventsClient:
                 
                 for msg in messages:
                     # Log do XML da mensagem para debug
-                    logger.info(f"📄 Message XML: {ET.tostring(msg, encoding='unicode')[:500]}")
+                    logger.debug(f"📄 Message XML: {ET.tostring(msg, encoding='unicode')[:500]}")
                     
                     event = self._parse_notification_message(msg)
                     if event:
@@ -625,11 +632,26 @@ class OnvifEventsClient:
             except ET.ParseError as e:
                 logger.error(f"XML parse error: {e}")
                 logger.debug(f"Response: {response[:500]}")
-        else:
-            # Log se não recebeu resposta - pode indicar problema de auth
-            logger.warning("⚠️ PullMessages sem resposta - possível problema de autenticação")
         
         return events
+    
+    def _get_pull_body(self, format_idx: int) -> str:
+        """Retorna o body de PullMessages para o formato especificado"""
+        if format_idx == 0:
+            return '''<tev:PullMessages>
+                <tev:Timeout>PT5S</tev:Timeout>
+                <tev:MessageLimit>100</tev:MessageLimit>
+            </tev:PullMessages>'''
+        elif format_idx == 1:
+            return '''<PullMessages xmlns="http://www.onvif.org/ver10/events/wsdl">
+                <Timeout>PT5S</Timeout>
+                <MessageLimit>100</MessageLimit>
+            </PullMessages>'''
+        else:
+            return '''<wsnt:PullMessages xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
+                <wsnt:Timeout>PT5S</wsnt:Timeout>
+                <wsnt:MessageLimit>100</wsnt:MessageLimit>
+            </wsnt:PullMessages>'''
     
     def _parse_notification_message(self, msg: ET.Element) -> Optional[OnvifEvent]:
         """Parse uma NotificationMessage ONVIF"""
@@ -733,19 +755,51 @@ class OnvifEventsClient:
         
         return 'info'
     
+    def _should_renew_subscription(self) -> bool:
+        """Verifica se a subscription precisa ser renovada"""
+        if not self._subscription_created_at:
+            return True
+        elapsed = (datetime.now() - self._subscription_created_at).total_seconds()
+        return elapsed > self._subscription_ttl_seconds
+    
+    def _renew_subscription(self) -> bool:
+        """Renova a subscription se necessário"""
+        if not self._should_renew_subscription():
+            return True
+        
+        logger.info(f"🔄 Renovando subscription para {self.camera_name}...")
+        if self.create_pull_point_subscription():
+            self._subscription_created_at = datetime.now()
+            return True
+        return False
+    
     def _poll_loop(self):
-        """Loop de polling para eventos"""
-        logger.info(f"🔄 Iniciando poll loop para {self.camera_name}")
+        """Loop de polling para eventos - conexão persistente"""
+        logger.info(f"🔄 Poll loop iniciado para {self.camera_name} (conexão persistente)")
         poll_count = 0
         
         while self.running:
             try:
+                # Renova subscription se necessário (antes de expirar)
+                if self._should_renew_subscription():
+                    if not self._renew_subscription():
+                        logger.warning(f"⚠️ Falha ao renovar subscription de {self.camera_name}, tentando novamente em 30s...")
+                        self._poll_error_count += 1
+                        if self._poll_error_count > 5:
+                            logger.error(f"❌ Muitos erros para {self.camera_name}, pausando polling por 60s")
+                            time.sleep(60)
+                            self._poll_error_count = 0
+                            continue
+                        time.sleep(30)
+                        continue
+                    self._poll_error_count = 0
+                
                 events = self.pull_messages()
                 poll_count += 1
                 
-                # Log periódico para confirmar que está funcionando
-                if poll_count % 30 == 0:  # A cada 30 polls (~30 segundos)
-                    logger.info(f"🔄 Poll #{poll_count} para {self.camera_name} - aguardando eventos...")
+                # Log periódico menos frequente (a cada 60 polls = ~1 min)
+                if poll_count % 60 == 0:
+                    logger.debug(f"📡 {self.camera_name}: poll #{poll_count} - conexão ativa")
                 
                 for event in events:
                     logger.info(f"📥 Evento: {event.event_type} de {event.camera_name}")
@@ -756,29 +810,42 @@ class OnvifEventsClient:
                         except Exception as e:
                             logger.error(f"Error in event callback: {e}")
                 
+                # Reset error count on success
+                self._poll_error_count = 0
+                
             except Exception as e:
-                logger.error(f"Poll error: {e}")
+                self._poll_error_count += 1
+                if self._poll_error_count <= 3:
+                    logger.warning(f"⚠️ Poll error ({self._poll_error_count}): {e}")
+                elif self._poll_error_count == 4:
+                    logger.error(f"❌ Múltiplos erros de polling para {self.camera_name}, reduzindo logs...")
             
             time.sleep(1)  # Poll a cada 1 segundo
     
     def start(self) -> bool:
-        """Inicia a escuta de eventos"""
-        logger.info(f"🎯 Conectando a {self.camera_name} ({self.camera_ip})")
+        """Inicia a escuta de eventos com conexão única e persistente"""
+        if not self._connection_logged:
+            logger.info(f"🎯 Conectando a {self.camera_name} ({self.camera_ip}) - conexão única")
+            self._connection_logged = True
         
-        # Verifica capabilities
-        if not self.check_capabilities():
-            logger.warning(f"⚠️ Não foi possível verificar capabilities de {self.camera_name}")
+        # Verifica capabilities (uma vez)
+        if not self._working_auth_method:
+            if not self.check_capabilities():
+                logger.warning(f"⚠️ Não foi possível verificar capabilities de {self.camera_name}")
         
-        # Cria subscription
+        # Cria subscription inicial
         if not self.create_pull_point_subscription():
             logger.error(f"❌ Falha ao criar subscription para {self.camera_name}")
             return False
         
-        # Inicia thread de polling
+        self._subscription_created_at = datetime.now()
+        
+        # Inicia thread de polling (persistente)
         self.running = True
-        self.poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self.poll_thread = threading.Thread(target=self._poll_loop, daemon=True, name=f"onvif-{self.camera_ip}")
         self.poll_thread.start()
         
+        logger.info(f"✅ {self.camera_name}: conexão ONVIF estabelecida (subscription renovada automaticamente)")
         return True
     
     def stop(self):
@@ -792,13 +859,16 @@ class OnvifEventsClient:
 
 class OnvifEventsManager:
     """
-    Gerencia múltiplos clientes ONVIF de eventos
+    Gerencia múltiplos clientes ONVIF de eventos.
+    Mantém conexões persistentes e evita reconexões desnecessárias.
     """
     
     def __init__(self, event_callback: Callable[[OnvifEvent], None] = None):
         self.clients: Dict[str, OnvifEventsClient] = {}
         self.event_callback = event_callback
         self.lock = threading.Lock()
+        self._started_at = datetime.now()
+        logger.info("📡 OnvifEventsManager inicializado")
     
     def add_camera(
         self,
@@ -808,11 +878,21 @@ class OnvifEventsManager:
         camera_name: str = "",
         camera_port: int = 80,
     ) -> bool:
-        """Adiciona uma câmera para escuta de eventos"""
+        """Adiciona uma câmera para escuta de eventos (conexão persistente)"""
         with self.lock:
             if camera_ip in self.clients:
-                logger.warning(f"Câmera {camera_ip} já está registrada")
-                return False
+                client = self.clients[camera_ip]
+                if client.running:
+                    logger.debug(f"📡 {camera_ip}: já está conectado e ativo")
+                    return True
+                else:
+                    # Cliente existe mas não está rodando, remove e recria
+                    logger.info(f"📡 {camera_ip}: reconectando (estava inativo)")
+                    try:
+                        client.stop()
+                    except:
+                        pass
+                    del self.clients[camera_ip]
             
             client = OnvifEventsClient(
                 camera_ip=camera_ip,
@@ -825,34 +905,49 @@ class OnvifEventsManager:
             
             if client.start():
                 self.clients[camera_ip] = client
+                logger.info(f"✅ {camera_name} ({camera_ip}): conexão ONVIF persistente estabelecida")
                 return True
             
+            logger.warning(f"⚠️ {camera_name} ({camera_ip}): falha ao estabelecer conexão ONVIF")
             return False
     
     def remove_camera(self, camera_ip: str):
         """Remove uma câmera da escuta"""
         with self.lock:
             if camera_ip in self.clients:
+                logger.info(f"🛑 Removendo escuta ONVIF de {camera_ip}")
                 self.clients[camera_ip].stop()
                 del self.clients[camera_ip]
     
     def stop_all(self):
-        """Para todos os clientes"""
+        """Para todos os clientes - chamado quando o app fecha"""
         with self.lock:
-            for client in self.clients.values():
-                client.stop()
+            logger.info(f"🛑 Encerrando {len(self.clients)} conexões ONVIF...")
+            for ip, client in self.clients.items():
+                try:
+                    client.stop()
+                    logger.debug(f"   ✓ {ip} desconectado")
+                except Exception as e:
+                    logger.warning(f"   ⚠️ Erro ao desconectar {ip}: {e}")
             self.clients.clear()
+            logger.info("✅ Todas as conexões ONVIF encerradas")
     
     def get_status(self) -> Dict:
         """Retorna status de todas as câmeras"""
         with self.lock:
+            active_count = sum(1 for c in self.clients.values() if c.running)
             return {
-                ip: {
-                    "name": client.camera_name,
-                    "running": client.running,
-                    "subscription": client.subscription_reference is not None,
+                "total_cameras": len(self.clients),
+                "active_cameras": active_count,
+                "uptime_seconds": (datetime.now() - self._started_at).total_seconds(),
+                "cameras": {
+                    ip: {
+                        "name": client.camera_name,
+                        "running": client.running,
+                        "subscription_active": client.subscription_reference is not None,
+                    }
+                    for ip, client in self.clients.items()
                 }
-                for ip, client in self.clients.items()
             }
 
 

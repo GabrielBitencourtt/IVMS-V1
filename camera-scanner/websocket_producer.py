@@ -48,16 +48,20 @@ class WebSocketProducer:
     """
     
     def __init__(self, 
-                 server_url: str = "wss://hopper.proxy.rlwy.net:443",
-                 on_status_change: Optional[Callable] = None):
+                 server_url: str = "wss://ivms-v1-production.up.railway.app",
+                 on_status_change: Optional[Callable] = None,
+                 ffmpeg_path: Optional[str] = None):
         self.server_url = server_url.rstrip('/')
         self.on_status_change = on_status_change
         self.active_streams: dict[str, WebSocketStream] = {}
         self._running = True
-        self._ffmpeg_path: Optional[str] = None
+        self._ffmpeg_path: Optional[str] = ffmpeg_path
         
-        # Inicializa FFmpeg
-        self._init_ffmpeg()
+        # Se não foi passado, tenta encontrar
+        if not self._ffmpeg_path:
+            self._init_ffmpeg()
+        else:
+            logger.info(f"✓ WebSocket Producer usando FFmpeg: {self._ffmpeg_path}")
     
     def _init_ffmpeg(self):
         """Encontra FFmpeg no sistema"""
@@ -66,8 +70,10 @@ class WebSocketProducer:
         self._ffmpeg_path = shutil.which("ffmpeg")
         
         if not self._ffmpeg_path:
-            # Tentar caminhos comuns
+            # Tentar caminhos comuns - incluindo diretório local do CameraScanner
             common_paths = [
+                os.path.join(os.environ.get('LOCALAPPDATA', ''), 'CameraScanner', 'ffmpeg', 'bin', 'ffmpeg.exe'),
+                r"C:\Users\gbdes\AppData\Local\CameraScanner\ffmpeg\bin\ffmpeg.exe",
                 r"C:\ffmpeg\bin\ffmpeg.exe",
                 r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
                 "/usr/bin/ffmpeg",
@@ -76,7 +82,7 @@ class WebSocketProducer:
             ]
             
             for path in common_paths:
-                if os.path.isfile(path):
+                if path and os.path.isfile(path):
                     self._ffmpeg_path = path
                     break
         
@@ -91,27 +97,37 @@ class WebSocketProducer:
     
     def _build_ffmpeg_command(self, rtsp_url: str) -> list:
         """
-        Constrói comando FFmpeg para extrair H.264 raw.
+        Constrói comando FFmpeg para streaming via WebSocket.
         
-        Saída: MPEG-TS via stdout (formato que o browser consegue processar via MSE)
+        Gera H.264 Annex B (NAL units) que o JMuxer consegue processar.
         """
         cmd = [
             self._ffmpeg_path,
             # Opções de entrada
-            "-fflags", "+genpts+discardcorrupt+nobuffer",
-            "-flags", "low_delay",
+            "-fflags", "+genpts+discardcorrupt",
             "-rtsp_transport", "tcp",
             "-timeout", "5000000",
             "-analyzeduration", "500000",
             "-probesize", "500000",
             "-i", rtsp_url,
-            # Opções de saída - MPEG-TS para stdout
-            "-c:v", "copy",             # Copy H.264 sem recodificar
-            "-an",                       # Sem áudio
-            "-f", "mpegts",              # Formato MPEG-TS (compatível com MSE)
-            "-muxdelay", "0",
-            "-muxpreload", "0",
-            "pipe:1"                     # Saída para stdout
+            # Recodificar para H.264 Baseline (máxima compatibilidade)
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-tune", "zerolatency",
+            "-profile:v", "baseline",
+            "-level", "3.1",
+            "-pix_fmt", "yuv420p",
+            "-b:v", "2000k",
+            "-maxrate", "2500k",
+            "-bufsize", "1000k",
+            "-g", "30",                  # Keyframe a cada 1 segundo
+            "-keyint_min", "30",
+            "-sc_threshold", "0",
+            "-an",
+            # Output H.264 raw (Annex B format com start codes)
+            "-f", "h264",
+            "-bsf:v", "h264_mp4toannexb",
+            "pipe:1"
         ]
         
         return cmd
@@ -146,6 +162,7 @@ class WebSocketProducer:
         try:
             # Iniciar FFmpeg
             cmd = self._build_ffmpeg_command(rtsp_url)
+            logger.info(f"   CMD: {' '.join(cmd[:5])}...")
             
             ffmpeg_process = subprocess.Popen(
                 cmd,
@@ -200,27 +217,101 @@ class WebSocketProducer:
     def _websocket_sender(self, stream_key: str, ffmpeg_process: subprocess.Popen, ws_url: str):
         """
         Thread que lê dados do FFmpeg e envia via WebSocket.
+        Mantém conexão persistente com reconexão automática.
         """
-        import websocket
+        try:
+            import websocket
+        except ImportError:
+            logger.error("❌ Biblioteca websocket-client não instalada!")
+            logger.error("   Execute: pip install websocket-client")
+            if stream_key in self.active_streams:
+                self.active_streams[stream_key].status = "error"
+                self.active_streams[stream_key].error_message = "websocket-client não instalado"
+            return
+        
+        import select
+        import sys
         
         ws = None
         reconnect_delay = 1
-        max_reconnect_delay = 30
+        max_reconnect_delay = 10
+        bytes_sent_log = 0
+        last_data_time = time.time()
+        ping_interval = 25
+        last_ping_time = time.time()
+        connection_established = False
+        
+        # Aguardar FFmpeg produzir dados iniciais
+        logger.info(f"⏳ Aguardando FFmpeg inicializar: {stream_key}")
+        startup_timeout = 10  # 10 segundos para FFmpeg inicializar
+        startup_start = time.time()
+        
+        while time.time() - startup_start < startup_timeout:
+            if ffmpeg_process.poll() is not None:
+                stderr_data = ffmpeg_process.stderr.read().decode('utf-8', errors='ignore')
+                logger.error(f"❌ FFmpeg encerrou durante inicialização: {stderr_data[-300:]}")
+                if stream_key in self.active_streams:
+                    self.active_streams[stream_key].status = "error"
+                    self.active_streams[stream_key].error_message = "FFmpeg falhou"
+                return
+            
+            # Verificar se tem dados disponíveis (non-blocking check on Windows)
+            # No Windows, select não funciona com pipes, então usamos peek
+            if sys.platform == 'win32':
+                import msvcrt
+                import ctypes
+                from ctypes import wintypes
+                
+                # Tentar ler um byte para ver se tem dados
+                try:
+                    # Usar PeekNamedPipe no Windows
+                    kernel32 = ctypes.windll.kernel32
+                    handle = msvcrt.get_osfhandle(ffmpeg_process.stdout.fileno())
+                    avail = ctypes.c_ulong(0)
+                    result = kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(avail), None)
+                    if result and avail.value > 0:
+                        logger.info(f"✅ FFmpeg produzindo dados ({avail.value} bytes disponíveis)")
+                        break
+                except Exception as e:
+                    # Se falhar, continua esperando
+                    pass
+            else:
+                # Unix - usar select
+                readable, _, _ = select.select([ffmpeg_process.stdout], [], [], 0.1)
+                if readable:
+                    logger.info(f"✅ FFmpeg produzindo dados")
+                    break
+            
+            time.sleep(0.5)
+        else:
+            # Timeout - mas vamos continuar tentando mesmo assim
+            logger.warning(f"⚠️ Timeout esperando FFmpeg, tentando continuar...")
         
         while self._running and stream_key in self.active_streams:
             try:
+                # Verificar se FFmpeg ainda está rodando
+                if ffmpeg_process.poll() is not None:
+                    logger.warning(f"⚠️ FFmpeg encerrou para {stream_key}")
+                    break
+                
                 # Conectar ao servidor
-                logger.info(f"🔌 Conectando ao servidor WebSocket: {ws_url}")
-                ws = websocket.create_connection(
-                    ws_url,
-                    timeout=10,
-                    skip_utf8_validation=True
-                )
-                logger.info(f"✅ WebSocket conectado: {stream_key}")
-                reconnect_delay = 1  # Reset delay on success
+                if ws is None:
+                    logger.info(f"🔌 Conectando ao servidor WebSocket: {ws_url}")
+                    
+                    ws = websocket.create_connection(
+                        ws_url,
+                        timeout=30,
+                        skip_utf8_validation=True,
+                        ping_interval=0,
+                        ping_timeout=None
+                    )
+                    logger.info(f"✅ WebSocket PRODUCER conectado: {stream_key}")
+                    reconnect_delay = 1
+                    last_ping_time = time.time()
+                    connection_established = True
                 
                 # Ler dados do FFmpeg e enviar
-                chunk_size = 4096  # 4KB chunks para baixa latência
+                chunk_size = 8192  # 8KB chunks
                 
                 while self._running and stream_key in self.active_streams:
                     # Verificar se FFmpeg ainda está rodando
@@ -228,22 +319,57 @@ class WebSocketProducer:
                         logger.warning(f"⚠️ FFmpeg encerrou para {stream_key}")
                         break
                     
-                    # Ler chunk do stdout
-                    data = ffmpeg_process.stdout.read(chunk_size)
+                    # Enviar ping periodicamente
+                    current_time = time.time()
+                    if current_time - last_ping_time > ping_interval:
+                        try:
+                            ws.ping()
+                            last_ping_time = current_time
+                        except Exception as ping_err:
+                            logger.warning(f"⚠️ Ping falhou: {ping_err}")
+                            break
+                    
+                    # Ler chunk do stdout (bloqueante, mas FFmpeg deve estar produzindo)
+                    try:
+                        data = ffmpeg_process.stdout.read(chunk_size)
+                    except Exception as read_err:
+                        logger.warning(f"⚠️ Erro ao ler FFmpeg: {read_err}")
+                        break
                     
                     if not data:
+                        if time.time() - last_data_time > 5:
+                            logger.warning(f"⚠️ Sem dados do FFmpeg por 5s: {stream_key}")
+                            last_data_time = time.time()
                         time.sleep(0.01)
                         continue
                     
-                    # Enviar dados binários diretamente
-                    ws.send_binary(data)
+                    last_data_time = time.time()
+                    
+                    # Enviar dados binários
+                    try:
+                        ws.send(data, opcode=websocket.ABNF.OPCODE_BINARY)
+                    except websocket.WebSocketConnectionClosedException:
+                        logger.warning(f"⚠️ Conexão fechada ao enviar dados")
+                        break
+                    except Exception as send_err:
+                        logger.warning(f"⚠️ Erro ao enviar: {send_err}")
+                        break
                     
                     # Atualizar contador
                     if stream_key in self.active_streams:
                         self.active_streams[stream_key].bytes_sent += len(data)
+                        bytes_sent_log += len(data)
+                        
+                        if bytes_sent_log >= 1024 * 1024:
+                            logger.info(f"📤 {stream_key}: {self.active_streams[stream_key].bytes_sent / 1024 / 1024:.1f} MB enviados")
+                            bytes_sent_log = 0
                 
             except websocket.WebSocketConnectionClosedException:
                 logger.warning(f"⚠️ WebSocket desconectado: {stream_key}")
+            except websocket.WebSocketTimeoutException:
+                logger.warning(f"⚠️ WebSocket timeout: {stream_key}")
+            except ConnectionRefusedError:
+                logger.warning(f"⚠️ Conexão recusada pelo servidor: {stream_key}")
             except Exception as e:
                 logger.error(f"❌ Erro WebSocket ({stream_key}): {e}")
             finally:
@@ -254,11 +380,15 @@ class WebSocketProducer:
                         pass
                     ws = None
             
-            # Reconectar com backoff
+            # Reconectar se stream ainda ativo
             if self._running and stream_key in self.active_streams:
+                # Verificar novamente se FFmpeg está rodando antes de reconectar
+                if ffmpeg_process.poll() is not None:
+                    logger.warning(f"⚠️ FFmpeg não está mais rodando, encerrando sender")
+                    break
                 logger.info(f"🔄 Reconectando em {reconnect_delay}s...")
                 time.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
         
         logger.info(f"🛑 WebSocket sender encerrado: {stream_key}")
     

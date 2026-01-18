@@ -259,8 +259,29 @@ async def create_stream(stream: StreamCreate, background_tasks: BackgroundTasks)
     Para RTMP push (source_url vazia): apenas registra e aguarda stream via nginx-rtmp
     Para RTSP/RTMP pull (source_url preenchida): inicia FFmpeg para conversão
     """
-    base_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "localhost:8080")
-    protocol = "https" if "railway" in base_url else "http"
+    # Obter URL base do servidor
+    # RAILWAY_PUBLIC_DOMAIN é definido automaticamente pelo Railway
+    # Também verificar RAILWAY_STATIC_URL e variável customizada
+    railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+    railway_static = os.getenv("RAILWAY_STATIC_URL", "")
+    custom_url = os.getenv("STREAMING_SERVER_URL", "")
+    
+    # Prioridade: custom > railway_domain > extrair de railway_static
+    if custom_url:
+        base_url = custom_url.replace("https://", "").replace("http://", "")
+        protocol = "https" if custom_url.startswith("https") else "http"
+    elif railway_domain:
+        base_url = railway_domain
+        protocol = "https"
+    elif railway_static:
+        base_url = railway_static.replace("https://", "").replace("http://", "")
+        protocol = "https"
+    else:
+        # Fallback para desenvolvimento local
+        base_url = os.getenv("SERVER_HOST", "localhost:8080")
+        protocol = "http"
+    
+    print(f"[create_stream] Using base_url: {protocol}://{base_url}")
     
     # Se source_url está vazia, é um stream RTMP push (OBS/câmera envia diretamente)
     if not stream.source_url or stream.source_url.strip() == "":
@@ -314,8 +335,23 @@ async def create_stream(stream: StreamCreate, background_tasks: BackgroundTasks)
 @app.get("/streams")
 async def list_streams():
     """Lista todas as streams ativas"""
-    base_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "localhost:8080")
-    protocol = "https" if "railway" in base_url else "http"
+    # Obter URL base consistente
+    railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+    railway_static = os.getenv("RAILWAY_STATIC_URL", "")
+    custom_url = os.getenv("STREAMING_SERVER_URL", "")
+    
+    if custom_url:
+        base_url = custom_url.replace("https://", "").replace("http://", "")
+        protocol = "https" if custom_url.startswith("https") else "http"
+    elif railway_domain:
+        base_url = railway_domain
+        protocol = "https"
+    elif railway_static:
+        base_url = railway_static.replace("https://", "").replace("http://", "")
+        protocol = "https"
+    else:
+        base_url = os.getenv("SERVER_HOST", "localhost:8080")
+        protocol = "http"
     
     streams = []
     for key, info in stream_manager.streams.items():
